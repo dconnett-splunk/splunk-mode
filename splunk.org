@@ -142,22 +142,7 @@
       ((let ((password (read-passwd "Password: ")))
          (auth-source-save :host host :user username :secret password)
          password)))))
-#+end_src
-** Basic Login Test
-#+begin_src elisp
-(defun splunk--get-auth-header ()
-  "Return the auth header.  Caches credentials per-session."
-  (unless splunk--auth-header
-    (let ((username (or splunk-splunk-username (read-string "Splunk username: ")))
-          (password (read-passwd "Splunk password: ")))
-      (setq splunk--auth-header (cons "Authorization"
-                                      (concat "Basic "
-                                              (base64-encode-string
-                                               (format "%s:%s" username password)))))))
-  splunk--auth-header)
-#+end_src
 
-#+begin_src elisp
 (defun splunk--prompt-for-credentials ()
   "Prompt for credentials."
   (let ((username (read-string "Username: " splunk-username))
@@ -185,7 +170,24 @@
       (dolist (host auth)
         (message "%s" host)))))
 (splunk-print-authsource)
-
+#+end_src
+** Basic Login Test
+#+begin_src elisp
+(defun splunk--get-auth-header ()
+  "Return the auth header.  Caches credentials per-session."
+  (unless splunk--auth-header
+    (let ((username (or splunk-username (read-string "Splunk username: ")))
+          (password (nth 1 (splunk-get-password "localhost" "admin" splunk-port))))
+      (setq splunk--auth-header (cons "Authorization"
+                                      (concat "Basic "
+                                              (base64-encode-string
+                                               (format "%s:%s" username password)))))))
+  splunk--auth-header)
+(splunk--get-auth-header)
+#+end_src
+** Perform Splunk Requests
+*** TODO Attempt to use jiralib.el:jiralib-call function for inspiration
+#+begin_src elisp
 
 ;; Print all hosts from authsource non-interactively
 (defun splunk-print-authsource-non-interactive ()

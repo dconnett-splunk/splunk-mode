@@ -112,43 +112,18 @@
 
 ;; [[file:splunk.org::*Authinfo Handlers][Authinfo Handlers:1]]
 ;; Get password from authinfo given host and username
-(defun splunk-get-password (host username port)
+(defun splunk-get-password (host username)
   "Get password from authinfo given HOST and USERNAME."
-  (let* ((auth-source-creation-prompts
-          '((user . "Splunk username: ")
-            (password . "Splunk password: ")))
-         (found (nth 0 (auth-source-search :max 1
-                                           :host host
-                                           :port port
-                                           :user username
-                                           :require '(:user :secret)
-                                           :create t))))
-    (if found
-        (list (plist-get found :user)
-              (let ((secret (plist-get found :secret)))
-                (if (functionp secret)
-                    (funcall secret)
-                  secret))
-              (plist-get found :save-function))
-      nil)))
+  (let ((authinfo (auth-source-search :host host :user username)))
+    (if authinfo
+        (let ((secret (plist-get (car authinfo) :secret)))
+          (if (functionp secret)
+              (funcall secret)
+            secret))
+      ((let ((password (read-passwd "Password: ")))
+         (auth-source-save :host host :user username :secret password)
+         password)))))
 
-(splunk-get-password "localhost" "admin" 8089)
-;; Authinfo Handlers:1 ends here
-
-;; [[file:splunk.org::*Basic Login Test][Basic Login Test:1]]
-(defun splunk--get-auth-header ()
-  "Return the auth header.  Caches credentials per-session."
-  (unless splunk--auth-header
-    (let ((username (or splunk-splunk-username (read-string "Splunk username: ")))
-          (password (read-passwd "Splunk password: ")))
-      (setq splunk--auth-header (cons "Authorization"
-                                      (concat "Basic "
-                                              (base64-encode-string
-                                               (format "%s:%s" username password)))))))
-  splunk--auth-header)
-;; Basic Login Test:1 ends here
-
-;; [[file:splunk.org::*Basic Login Test][Basic Login Test:2]]
 (defun splunk--prompt-for-credentials ()
   "Prompt for credentials."
   (let ((username (read-string "Username: " splunk-username))
@@ -176,8 +151,23 @@
       (dolist (host auth)
         (message "%s" host)))))
 (splunk-print-authsource)
+;; Authinfo Handlers:1 ends here
 
+;; [[file:splunk.org::*Basic Login Test][Basic Login Test:1]]
+(defun splunk--get-auth-header ()
+  "Return the auth header.  Caches credentials per-session."
+  (unless splunk--auth-header
+    (let ((username (or splunk-username (read-string "Splunk username: ")))
+          (password (nth 1 (splunk-get-password "localhost" "admin" splunk-port))))
+      (setq splunk--auth-header (cons "Authorization"
+                                      (concat "Basic "
+                                              (base64-encode-string
+                                               (format "%s:%s" username password)))))))
+  splunk--auth-header)
+(splunk--get-auth-header)
+;; Basic Login Test:1 ends here
 
+;; [[file:splunk.org::*Attempt to use jiralib.el:jiralib-call function for inspiration][Attempt to use jiralib.el:jiralib-call function for inspiration:1]]
 ;; Print all hosts from authsource non-interactively
 (defun splunk-print-authsource-non-interactive ()
   "Print all hosts from authsource non-interactively."
@@ -210,4 +200,4 @@
   "Login to splunk host using select-host and splunk-authenticate."
   (interactive)
   (splunk-select-host))
-;; Basic Login Test:2 ends here
+;; Attempt to use jiralib.el:jiralib-call function for inspiration:1 ends here
