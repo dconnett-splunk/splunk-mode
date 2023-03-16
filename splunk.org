@@ -42,9 +42,10 @@
 #+RESULTS:
 
 * Preamble
+This section includes declarations for a major mode in Emacs and required libraries.
 #+begin_src elisp
 (eval-when-compile (require 'cl))
-(require 'cl-seq)
+(require 'cl-lib)
 (require 'soap-client)
 (require 'request)
 (require 'json)
@@ -60,6 +61,7 @@
 : splunk
 
 * Variables
+This section defines the necessary variables
 #+begin_src elisp
 ;; Variables needed for splunk integration
 (defvar splunk-password nil)
@@ -188,7 +190,6 @@
 ** Perform Splunk Requests
 *** TODO Attempt to use jiralib.el:jiralib-call function for inspiration
 #+begin_src elisp
-
 ;; Print all hosts from authsource non-interactively
 (defun splunk-print-authsource-non-interactive ()
   "Print all hosts from authsource non-interactively."
