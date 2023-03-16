@@ -44,7 +44,6 @@
 (require 'json)
 (require 'url-parse)
 (require 'url-util)
-(require 'auth-source)
 
 (defgroup splunk nil
   "Splunk Mode"
@@ -104,15 +103,47 @@
 
 ;; [[file:splunk.org::*Basic URL Stuff and HTTP Request Stuff][Basic URL Stuff and HTTP Request Stuff:1]]
 ;; Create splunk url from host, port and endpoint
-(defun splunk--generate-url (host port endpoint)
+(defun splunk-generate-url (host port endpoint)
   "Create splunk url from HOST, PORT and ENDPOINT."
   (concat "https://" host ":" (number-to-string port) endpoint))
 
-(splunk--generate-url "localhost" 8089 "/services/search/jobs")
+(splunk-generate-url "localhost" 8089 "/services/search/jobs")
 ;; Basic URL Stuff and HTTP Request Stuff:1 ends here
 
 ;; [[file:splunk.org::*Authinfo Handlers][Authinfo Handlers:1]]
+;; This function is newer and should replace get password and add host.
+(defun get-splunk-credentials ()
+  (let ((credentials (auth-source-search
+                      :host "splunk.myhost.com"
+                      :port "8089"
+                      :user "myusername"
+                      :require '(:user :secret)
+                      :max 1
+                      :create t)))
+    (when credentials
+      (let* ((entry (car credentials))
+             (user (plist-get entry :user))
+             (password (let ((secret (plist-get entry :secret)))
+                         (if (functionp secret)
+                             (funcall secret)
+                           secret))))
+        (list user password)))))
+
+
+
 ;; Get password from authinfo given host and username
+(defun splunk-get-password (host username)
+  "Get password from authinfo given HOST and USERNAME."
+  (let ((authinfo (auth-source-search :host host :user username)))
+    (if authinfo
+        (let ((secret (plist-get (car authinfo) :secret)))
+          (if (functionp secret)
+              (funcall secret)
+            secret))
+      ((let ((password (read-passwd "Password: ")))
+         (auth-source-save :host host :user username :secret password)
+         password)))))
+
 (defun splunk--prompt-for-credentials ()
   "Prompt for credentials."
   (let ((username (read-string "Username: " splunk-username))
@@ -132,21 +163,14 @@
 
 ;; Print all hosts from authsource
 ;; This is useful for debugging
-(defun splunk--print-authsource ()
+(defun splunk-print-authsource ()
   "Print all hosts from authsource."
   (interactive)
   (let ((auth (auth-source-search :max 1000)))
     (when auth
       (dolist (host auth)
         (message "%s" host)))))
-(splunk--print-authsource)
-
-;; Given authinfo host, username, port, and password, save credentials in authinfo
-(defun splunk--credentials (host username port)
-  "Given authinfo HOST, USERNAME, PORT, and PASSWORD, save credentials in authinfo.")
-
-;; auth-source-save function saves the credentials in authinfo
-;; but it does not return the password
+(splunk-print-authsource)
 ;; Authinfo Handlers:1 ends here
 
 ;; [[file:splunk.org::*Basic Login Test][Basic Login Test:1]]
@@ -154,7 +178,7 @@
   "Return the auth header.  Caches credentials per-session."
   (unless splunk--auth-header
     (let ((username (or splunk-username (read-string "Splunk username: ")))
-          (password (nth 1 (splunk--get-password "localhost" "admin" splunk-port))))
+          (password (nth 1 (splunk-get-password "localhost" "admin" splunk-port))))
       (setq splunk--auth-header (cons "Authorization"
                                       (concat "Basic "
                                               (base64-encode-string
@@ -165,18 +189,17 @@
 
 ;; [[file:splunk.org::*Attempt to use jiralib.el:jiralib-call function for inspiration][Attempt to use jiralib.el:jiralib-call function for inspiration:1]]
 ;; Print all hosts from authsource non-interactively
-(defun splunk--print-authsource-non-interactive ()
-  (interactive)
+(defun splunk-print-authsource-non-interactive ()
   "Print all hosts from authsource non-interactively."
   (let ((auth (auth-source-search :max 1000)))
     (when auth
       (dolist (host auth)
         (message "%s" host)))))
 
-(splunk--print-authsource-non-interactive)
+(splunk-print-authsource-non-interactive)
 ;; print a list of saved splunk hosts
 ;; this is useful for debugging
-(defun splunk--print-hosts ()
+(defun splunk-print-hosts ()
   "Print a list of saved splunk hosts consed together in a a lisr"
   (interactive)
   (message "%s" splunk-hosts))
@@ -184,50 +207,83 @@
 ;; prompt for a new host and set the splunk-host variable to the new host
 ;; set credentials for the new host if none are found
 ;; authenticate with splunk
-(defun splunk--change-host ()
+(defun splunk-change-host ()
   "Change current splunk host."
   (interactive)
-  (let ((host (read-string "Host: " splunk-host))
-        )
+  (let ((host (read-string "Host: " splunk-host)))
     (setq splunk-host host)
     (customize-save-variable 'splunk-host splunk-host)
-    (splunk--authenticate)))
-
-(defun nnimap-credentials (address ports)
-  (let* ((auth-source-creation-prompts '((user  . "IMAP user at %h: ") (secret . "IMAP password for %u@%h: ")))
-         (found-credential (nth 0 (auth-source-search :max 1
-                                           :host address
-                                           :port ports
-                                           :require '(:user :secret)
-                                           :create t))))
-    (if found-credential
-        (list (plist-get found-credential :user)
-              (let ((secret (plist-get found-credential :secret)))
-                (if (functionp secret)
-                    (funcall secret)
-                  secret))
-              (plist-get found-credential :save-function))
-      nil)))
+    (splunk-authenticate)))
 
 ;; login to splunk host using select-host and splunk-authenticate
-(defun splunk--login (host &optional username port)
+(defun splunk-login ()
   "Login to splunk host using select-host and splunk-authenticate."
-  ;; if host exists in authinfo then use it
-  (let* (if username ((auth-source-creation-prompts
-                       '((user . "Splunk username at %h: ")
-                         (secret . "Splunk password at %u@%h: "))))
+  (interactive)
+  (splunk-select-host))
+;; Attempt to use jiralib.el:jiralib-call function for inspiration:1 ends here
 
-          (found (nth 0 (auth-source-search :max 1
-                                            :host host
-                                            :port port
-                                            :require '(:user :secret)
-                                            :create t))))
-    (if found
-        (list (plist-get found :user)
-              (let ((secret (plist-get found :secret)))
-                (if (functionp secret)
-                    (funcall secret)
-                  secret))
-              (plist-get found :save-function))
-      nil)))
-(splunk--login "localhost" "admin" 8089)
+;; [[file:splunk.org::*Refactor with help from GPT4][Refactor with help from GPT4:1]]
+(defun splunk--get-credentials ()
+  (let* ((auth-source-creation-prompts
+          '((user . "Splunk user at %h: ")
+            (secret . "Splunk password for %u@%h: ")
+            (service . "Splunk service: ")))
+         (credentials (auth-source-search
+                       :service "splunk"
+                       :require '(:user :secret :service)
+                       :create t)))
+    credentials))
+
+(defun splunk--get-credentials ()
+  (let* ((auth-source-creation-prompts
+          '((user . "Splunk user at %h: ")
+            (secret . "Splunk password for %u@%h: ")
+            (service . "Splunk service: ")))
+         (auth-source-cache-expiry 0) ; Force cache clear
+         (credentials (auth-source-search
+                       :service "splunk"
+                       :require '(:user :secret :service)
+                       :create t)))
+    credentials))
+
+
+(defun splunk-prompt-select-host (credentials)
+  (completing-read "Select a Splunk host: "
+                   (mapcar (lambda (entry) (plist-get entry :host)) credentials)))
+
+(defun splunk-generate-auth-header (user password)
+  (concat "Basic " (base64-encode-string (format "%s:%s" user password))))
+
+(require 'url)
+
+(defun splunk-send-login-request (host port auth-header)
+  (let ((url-request-method "POST")
+        (url-request-extra-headers `(("Authorization" . ,auth-header)))
+        (url (format "https://%s:%s/services/auth/login" host port)))
+    (with-current-buffer (url-retrieve-synchronously url)
+      (prog1 (buffer-string)
+        (kill-buffer)))))
+
+
+(require 'xml)
+
+(defun splunk-cache-login-token (response)
+  (let ((xml-response (car (xml-parse-region (point-min) (point-max) response))))
+    (when (and (listp xml-response) (eq (car xml-response) 'sessionKey))
+      (cdr (car (cdr xml-response))))))
+
+(defun splunk--login ()
+  (let* ((credentials (splunk--get-credentials))
+         (selected-host (splunk-prompt-select-host credentials))
+         (selected-creds (car (seq-filter (lambda (entry) (string= (plist-get entry :host) selected-host)) credentials)))
+         (user (plist-get selected-creds :user))
+         (password (let ((secret (plist-get selected-creds :secret)))
+                     (if (functionp secret) (funcall secret) secret)))
+         (port (plist-get selected-creds :port))
+         (auth-header (splunk-generate-auth-header user password))
+         (response (splunk-send-login-request selected-host port auth-header))
+         (token (splunk-cache-login-token response)))
+    token))
+
+(splunk--login)
+;; Refactor with help from GPT4:1 ends here
