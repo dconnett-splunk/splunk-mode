@@ -132,39 +132,6 @@ This section defines the necessary variables
 
 ** Authinfo Handlers
 #+begin_src elisp
-;; This function is newer and should replace get password and add host.
-(defun get-splunk-credentials ()
-  (let ((credentials (auth-source-search
-                      :host "splunk.myhost.com"
-                      :port "8089"
-                      :user "myusername"
-                      :require '(:user :secret)
-                      :max 1
-                      :create t)))
-    (when credentials
-      (let* ((entry (car credentials))
-             (user (plist-get entry :user))
-             (password (let ((secret (plist-get entry :secret)))
-                         (if (functionp secret)
-                             (funcall secret)
-                           secret))))
-        (list user password)))))
-
-
-
-;; Get password from authinfo given host and username
-(defun splunk-get-password (host username)
-  "Get password from authinfo given HOST and USERNAME."
-  (let ((authinfo (auth-source-search :host host :user username)))
-    (if authinfo
-        (let ((secret (plist-get (car authinfo) :secret)))
-          (if (functionp secret)
-              (funcall secret)
-            secret))
-      ((let ((password (read-passwd "Password: ")))
-         (auth-source-save :host host :user username :secret password)
-         password)))))
-
 (defun splunk--prompt-for-credentials ()
   "Prompt for credentials."
   (let ((username (read-string "Username: " splunk-username))
@@ -184,6 +151,7 @@ This section defines the necessary variables
 
 ;; Print all hosts from authsource
 ;; This is useful for debugging
+;; Also breaks sometimes, and prints MacOS keyring
 (defun splunk-print-authsource ()
   "Print all hosts from authsource."
   (interactive)
@@ -191,21 +159,23 @@ This section defines the necessary variables
     (when auth
       (dolist (host auth)
         (message "%s" host)))))
-(splunk-print-authsource)
 #+end_src
 ** Basic Login Test
 #+begin_src elisp
-(defun splunk--get-auth-header ()
-  "Return the auth header.  Caches credentials per-session."
-  (unless splunk--auth-header
-    (let ((username (or splunk-username (read-string "Splunk username: ")))
-          (password (nth 1 (splunk-get-password "localhost" "admin" splunk-port))))
-      (setq splunk--auth-header (cons "Authorization"
-                                      (concat "Basic "
-                                              (base64-encode-string
-                                               (format "%s:%s" username password)))))))
-  splunk--auth-header)
-(splunk--get-auth-header)
+;; Tested working
+    ;; (let* ((auth-sources '("~/.authinfo.gpg"))
+    ;;        (auth-source-creation-prompts
+    ;;         '((user . "Enter username: ")
+    ;;           (secret . "Enter password: ")))
+    ;;        (entry (nth 0 (auth-source-search
+    ;;                       :host splunk-host
+    ;;                       :port splunk-port
+    ;;                       :require '(:user :secret)
+    ;;                       :create t))))
+    ;;   (if entry
+    ;;       (when-let ((save-function (plist-get entry :save-function)))
+    ;;         (funcall save-function))
+    ;;     (message "Failed to create a new entry")))
 #+end_src
 ** Perform Splunk Requests
 *** TODO Attempt to use jiralib.el:jiralib-call function for inspiration
@@ -218,7 +188,6 @@ This section defines the necessary variables
       (dolist (host auth)
         (message "%s" host)))))
 
-(splunk-print-authsource-non-interactive)
 ;; print a list of saved splunk hosts
 ;; this is useful for debugging
 (defun splunk-print-hosts ()
@@ -236,41 +205,32 @@ This section defines the necessary variables
     (setq splunk-host host)
     (customize-save-variable 'splunk-host splunk-host)
     (splunk-authenticate)))
-
-;; login to splunk host using select-host and splunk-authenticate
-(defun splunk-login ()
-  "Login to splunk host using select-host and splunk-authenticate."
-  (interactive)
-  (splunk-select-host))
 #+end_src
 
 #+RESULTS:
 : splunk-login
 ** Refactor with help from GPT4
 #+begin_src elisp
-(defun splunk--get-credentials ()
-  (let* ((auth-source-creation-prompts
-          '((user . "Splunk user at %h: ")
-            (secret . "Splunk password for %u@%h: ")
-            (service . "Splunk service: ")))
-         (credentials (auth-source-search
-                       :service "splunk"
-                       :require '(:user :secret :service)
-                       :create t)))
-    credentials))
+;; (defun splunk--get-credentials ()
+;;   (let* ((auth-source-creation-prompts
+;;           '((user . "Splunk user at %h: ")
+;;             (secret . "Splunk password for %u@%h: ")
+;;             (service . "Splunk service: ")))
+;;                   ;;(auth-source-cache-expiry 0) ; Force cache clear
+;;          (credentials (auth-source-search
+;;                        :service "splunk"
+;;                        :require '(:user :secret :service)
+;;                        :create t)))
+;;     credentials))
 
+;; Use this function for now, too complicated to genericize it for now
 (defun splunk--get-credentials ()
-  (let* ((auth-source-creation-prompts
-          '((user . "Splunk user at %h: ")
-            (secret . "Splunk password for %u@%h: ")
-            (service . "Splunk service: ")))
-         (auth-source-cache-expiry 0) ; Force cache clear
-         (credentials (auth-source-search
-                       :service "splunk"
-                       :require '(:user :secret :service)
-                       :create t)))
+  (let* ((credentials (auth-source-search
+                       :host splunk-host
+                       :port splunk-port
+                       :require '(:user :secret)
+                       :max 1)))
     credentials))
-
 
 (defun splunk-prompt-select-host (credentials)
   (completing-read "Select a Splunk host: "
@@ -298,17 +258,130 @@ This section defines the necessary variables
       (cdr (car (cdr xml-response))))))
 
 (defun splunk--login ()
+  (interactive)
   (let* ((credentials (splunk--get-credentials))
-         (selected-host (splunk-prompt-select-host credentials))
-         (selected-creds (car (seq-filter (lambda (entry) (string= (plist-get entry :host) selected-host)) credentials)))
-         (user (plist-get selected-creds :user))
-         (password (let ((secret (plist-get selected-creds :secret)))
-                     (if (functionp secret) (funcall secret) secret)))
-         (port (plist-get selected-creds :port))
-         (auth-header (splunk-generate-auth-header user password))
-         (response (splunk-send-login-request selected-host port auth-header))
-         (token (splunk-cache-login-token response)))
-    token))
+         (user (plist-get (car credentials) :user))
+         (secret (plist-get (car credentials) :secret))
+         (password (if (functionp secret) (funcall secret) secret)))
+    (message "Logging in with user: %s and password: %s" user password)))
 
-(splunk--login)
+
+(defun splunk--generate-auth-header ()
+  "Generate an Authorization header for Splunk requests."
+  (let ((credentials (splunk--get-credentials)))
+    (when credentials
+      (let ((user (plist-get credentials :user))
+            (secret (plist-get credentials :secret)))
+        (when (and user secret)
+          (let ((password (if (functionp secret) (funcall secret) secret)))
+            (concat "Basic " (base64-encode-string (concat user ":" password)))))))))
+
+(defun splunk-create-search-job-callback (status)
+  (if (plist-get status :error)
+      (message "Error creating search job: %s" (plist-get status :error))
+    (message "Search job created successfully")))
+
+
+(defun splunk-generate-auth-header (user password)
+  (concat "Basic " (base64-encode-string (format "%s:%s" user password))))
+
+(defun splunk-create-search-job (search-query)
+  (interactive "sEnter search query: ")
+  (let* ((credentials (splunk--get-credentials))
+         (user (plist-get (car credentials) :user))
+         (secret (plist-get (car credentials) :secret))
+         (password (if (functionp secret) (funcall secret) secret))
+         (url (format "https://%s:%s/services/search/jobs" splunk-host splunk-port))
+         (url-user-and-password (format "%s:%s" user password))
+         (url-request-method "POST")
+         (url-request-extra-headers `(("Content-Type" . "application/x-www-form-urlencoded")
+                                       ("Authorization" . ,(concat "Basic " (base64-encode-string url-user-and-password)))))
+         (url-request-data (format "search=%s" (url-hexify-string (concat "search " search-query)))))
+    (url-retrieve url #'splunk-create-search-job-callback)))
+
+(defun splunk-request (method endpoint params)
+  (let* ((url (format "https://%s:%d%s" splunk-host splunk-port endpoint))
+         (headers `(("Authorization" . ,(splunk--generate-auth-header))))
+         (response (request url
+                    :type method
+                    :params params
+                    :headers headers
+                    :parser 'json-read
+                    :sync t
+                    :error (cl-function
+                            (lambda (&key error-thrown &allow-other-keys)
+                              (message "Got error: %S" error-thrown)))
+                    :status-code '((401 . (lambda (&rest _) (message "Unauthorized. Please check your credentials."))))))
+         (data (request-response-data response)))
+    (progn
+      (message "Response: %S" response)  ; Print the response
+      data)))
+
+(defun splunk-create-search-job (search-query)
+  (splunk-request "POST" "/services/search/jobs" `(("search" . ,(concat "search " search-query)))))
+
 #+end_src
+** GUI Section
+#+begin_src elisp
+(require 'magit)
+
+(defvar splunk-overview-buffer-name "*splunk-overview*"
+  "Name of the Splunk overview buffer.")
+
+(define-derived-mode splunk-overview-mode magit-mode "Splunk-Overview"
+  "Major mode for interacting with Splunk."
+  (read-only-mode -1))
+
+(defun splunk-overview-placeholder ()
+  "Placeholder function for unimplemented menu actions."
+  (interactive)
+  (splunk-overview))
+
+(defun splunk-overview (&optional successor)
+  "Display the Splunk overview buffer and optionally navigate to a specific section."
+  (interactive)
+  ;; Kill existing buffer with the same name, if any.
+  (when-let ((existing-buffer (get-buffer splunk-overview-buffer-name)))
+    (kill-buffer existing-buffer))
+  (let ((buffer (get-buffer-create splunk-overview-buffer-name)))
+    (with-current-buffer buffer
+      (splunk-overview-mode)
+      (setq-local magit-branch-buffer buffer)
+      (setq-local magit-section-show-child-count t)
+
+      ;; Clear the hook and add the function inside splunk-overview
+      (setq-local splunk-overview-sections-hook nil)
+      (add-hook 'splunk-overview-sections-hook 'splunk-overview-insert-menu)
+
+      (magit-insert-section (splunk-overview)
+        (run-hooks 'splunk-overview-sections-hook)
+        (insert "Welcome to Splunk Overview.\n"))
+      (when successor
+        (magit-section-goto-successor successor)))
+    (switch-to-buffer buffer)))
+
+(define-key splunk-overview-mode-map (kbd "1") 'splunk-overview-placeholder)
+(define-key splunk-overview-mode-map (kbd "2") 'splunk-overview-placeholder)
+(define-key splunk-overview-mode-map (kbd "3") 'splunk-overview-placeholder)
+
+
+(defun splunk-overview-insert-menu ()
+  "Insert the menu section in the Splunk overview buffer."
+  (let ((inhibit-read-only t)) ; Allow writing to the buffer
+    (magit-insert-section (menu nil)
+      (magit-insert-heading "Menu:")
+      (magit-insert-section (search nil)
+        (insert "1. Search\n"))
+      (magit-insert-section (recent-searches nil)
+        (insert "2. Recent Searches\n"))
+      (magit-insert-section (configure nil)
+        (insert "3. Configure\n"))
+      (insert "\n"))))
+
+(add-hook 'splunk-overview-sections-hook 'splunk-overview-insert-menu)
+
+
+#+end_src
+
+#+RESULTS:
+: your-configure-function
