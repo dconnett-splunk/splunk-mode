@@ -1,4 +1,6 @@
 ;; [[file:splunk.org::*License][License:1]]
+;;; splunk-mode.el --- Run Splunk search commands, export results to CSV/HTML/JSON  -*- lexical-binding: t; -*-
+
 ;; Copyright (C) 2019 Sebastian Monia
 ;; Copyright (C) 2022 David Connett
 ;;
@@ -6,7 +8,7 @@
 ;; Author: David Connett <dave.connett@gmail.com>
 ;;
 ;; URL: https://github.com/sebasmonia/splunk.git
-;; Package-Requires: ((emacs "25") (csv "2.1"))
+;; Package-Requires: ((emacs "25.1") (csv "2.1"))
 ;; Version: 1.0
 ;; Keywords: tools convenience matching
 
@@ -31,13 +33,14 @@
 
 ;;; Code:
 ;;;
+;;; Test
 ;; This buffer is for text that is not saved, and for Lisp evaluation.
 ;; To create a file, visit it with C-x C-f and enter text in its buffer.
 ;;
 ;; License:1 ends here
 
 ;; [[file:splunk.org::*Preamble][Preamble:1]]
-(eval-when-compile (require 'cl))
+(eval-when-compile (require 'cl-lib))
 (require 'cl-lib)
 (require 'soap-client)
 (require 'request)
@@ -62,38 +65,38 @@
   :group 'splunk)
 
 (defcustom splunk-port 8089
-        "Splunk port"
-        :type 'integer
-        :group 'splunk)
+  "Splunk port"
+  :type 'integer
+  :group 'splunk)
 
 (defcustom splunk-username "admin"
-        "Splunk username"
-        :type 'string
-        :group 'splunk)
+  "Splunk username"
+  :type 'string
+  :group 'splunk)
 
 ;; list of all hosts stored by user
 (defcustom splunk-hosts nil
-        "List of all hosts stored by user"
-        :type 'list
-        :group 'splunk)
+  "List of all hosts stored by user"
+  :type 'list
+  :group 'splunk)
 
 ;; Splunk logins, stores list of hostnames and associated usernames
 (defcustom splunk-logins nil
-        "List of all logins stored by user"
-        :type 'list
-        :group 'splunk)
+  "List of all logins stored by user"
+  :type 'list
+  :group 'splunk)
 
 ;; Splunk login endpoint
 (defcustom splunk-login-endpoint "/services/auth/login"
-        "Splunk login endpoint"
-        :type 'string
-        :group 'splunk)
+  "Splunk login endpoint"
+  :type 'string
+  :group 'splunk)
 
 ;; Splunk search endpoint
 (defcustom splunk-search-endpoint "/services/search/jobs"
-        "Splunk search endpoint"
-        :type 'string
-        :group 'splunk)
+  "Splunk search endpoint"
+  :type 'string
+  :group 'splunk)
 
 (defvar splunk--pending-requests (make-vector 20 nil) "Holds data for the pending requests.")
 (defvar splunk--request-history nil "Holds the list requests completed.")
@@ -142,19 +145,19 @@
 
 ;; [[file:splunk.org::*Basic Login Test][Basic Login Test:1]]
 ;; Tested working
-    ;; (let* ((auth-sources '("~/.authinfo.gpg"))
-    ;;        (auth-source-creation-prompts
-    ;;         '((user . "Enter username: ")
-    ;;           (secret . "Enter password: ")))
-    ;;        (entry (nth 0 (auth-source-search
-    ;;                       :host splunk-host
-    ;;                       :port splunk-port
-    ;;                       :require '(:user :secret)
-    ;;                       :create t))))
-    ;;   (if entry
-    ;;       (when-let ((save-function (plist-get entry :save-function)))
-    ;;         (funcall save-function))
-    ;;     (message "Failed to create a new entry")))
+;; (let* ((auth-sources '("~/.authinfo.gpg"))
+;;        (auth-source-creation-prompts
+;;         '((user . "Enter username: ")
+;;           (secret . "Enter password: ")))
+;;        (entry (nth 0 (auth-source-search
+;;                       :host splunk-host
+;;                       :port splunk-port
+;;                       :require '(:user :secret)
+;;                       :create t))))
+;;   (if entry
+;;       (when-let ((save-function (plist-get entry :save-function)))
+;;         (funcall save-function))
+;;     (message "Failed to create a new entry")))
 ;; Basic Login Test:1 ends here
 
 ;; [[file:splunk.org::*Attempt to use jiralib.el:jiralib-call function for inspiration][Attempt to use jiralib.el:jiralib-call function for inspiration:1]]
@@ -240,7 +243,6 @@
          (password (if (functionp secret) (funcall secret) secret)))
     (message "Logging in with user: %s and password: %s" user password)))
 
-
 (defun splunk--generate-auth-header ()
   "Generate an Authorization header for Splunk requests."
   (let ((credentials (splunk--get-credentials)))
@@ -257,6 +259,16 @@
     (message "Search job created successfully")))
 
 
+(defun splunk-create-search-job-callback (status)
+  (if (plist-get status :error)
+      (message "Error creating search job: %s" (plist-get status :error))
+    (let ((splunk-results (plist-get status :data))) ; Replace with actual data extraction
+      (with-current-buffer (get-buffer-create "*Splunk Results*")
+        (erase-buffer)
+        (insert (format "%S" splunk-results))  ; Transform your data accordingly
+        (switch-to-buffer-other-window (current-buffer))))))
+
+
 (defun splunk-generate-auth-header (user password)
   (concat "Basic " (base64-encode-string (format "%s:%s" user password))))
 
@@ -270,7 +282,7 @@
          (url-user-and-password (format "%s:%s" user password))
          (url-request-method "POST")
          (url-request-extra-headers `(("Content-Type" . "application/x-www-form-urlencoded")
-                                       ("Authorization" . ,(concat "Basic " (base64-encode-string url-user-and-password)))))
+                                      ("Authorization" . ,(concat "Basic " (base64-encode-string url-user-and-password)))))
          (url-request-data (format "search=%s" (url-hexify-string (concat "search " search-query)))))
     (url-retrieve url #'splunk-create-search-job-callback)))
 
@@ -278,21 +290,22 @@
   (let* ((url (format "https://%s:%d%s" splunk-host splunk-port endpoint))
          (headers `(("Authorization" . ,(splunk--generate-auth-header))))
          (response (request url
-                    :type method
-                    :params params
-                    :headers headers
-                    :parser 'json-read
-                    :sync t
-                    :error (cl-function
-                            (lambda (&key error-thrown &allow-other-keys)
-                              (message "Got error: %S" error-thrown)))
-                    :status-code '((401 . (lambda (&rest _) (message "Unauthorized. Please check your credentials."))))))
+                     :type method
+                     :params params
+                     :headers headers
+                     :parser 'json-read
+                     :sync t
+                     :error (cl-function
+                             (lambda (&key error-thrown &allow-other-keys)
+                               (message "Got error: %S" error-thrown)))
+                     :status-code '((401 . (lambda (&rest _) (message "Unauthorized. Please check your credentials."))))))
          (data (request-response-data response)))
     (progn
       (message "Response: %S" response)  ; Print the response
       data)))
 
-(defun splunk-create-search-job (search-query)
+
+(defun splunk-create-search-job-request (search-query)
   (splunk-request "POST" "/services/search/jobs" `(("search" . ,(concat "search " search-query)))))
 ;; Refactor with help from GPT4:1 ends here
 
@@ -334,15 +347,21 @@
         (magit-section-goto-successor successor)))
     (switch-to-buffer buffer)))
 
-(define-key splunk-overview-mode-map (kbd "1") 'splunk-overview-placeholder)
+(define-key splunk-overview-mode-map (kbd "1") 'splunk-create-search-job)
 (define-key splunk-overview-mode-map (kbd "2") 'splunk-overview-placeholder)
 (define-key splunk-overview-mode-map (kbd "3") 'splunk-overview-placeholder)
-
 
 (defun splunk-overview-insert-menu ()
   "Insert the menu section in the Splunk overview buffer."
   (let ((inhibit-read-only t)) ; Allow writing to the buffer
     (magit-insert-section (menu nil)
+      (magit-insert-heading "Server:")
+      ;; Display the current server information
+      (insert (format "Host: %s\n" splunk-host))
+      (insert (format "Port: %s\n" splunk-port))
+      (insert (format "Username: %s\n" splunk-username))
+      (insert "\n")
+
       (magit-insert-heading "Menu:")
       (magit-insert-section (search nil)
         (insert "1. Search\n"))
@@ -354,3 +373,8 @@
 
 (add-hook 'splunk-overview-sections-hook 'splunk-overview-insert-menu)
 ;; GUI Section:1 ends here
+
+;; [[file:splunk.org::*Footer][Footer:1]]
+(provide 'splunk-mode)
+;;; splunk-mode.el ends here
+;; Footer:1 ends here

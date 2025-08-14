@@ -17,6 +17,7 @@
 (require 'auth-source)
 (require 'base64)
 (require 'seq)
+(auth-source-search :host "HOST" :user "USER" :secret "PASSWORD" :force-side "LIGHT" :create '(force-side))
 
 
 
