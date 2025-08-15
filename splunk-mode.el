@@ -154,6 +154,12 @@
   :type 'string
   :group 'splunk)
 
+(defcustom splunk-disable-ssl-verification nil
+  "If non-nil, disable SSL certificate verification for Splunk connections.
+Useful for self-signed certificates. WARNING: This reduces security!"
+  :type 'boolean
+  :group 'splunk)
+
 (defvar splunk--pending-requests (make-vector 20 nil) "Holds data for the pending requests.")
 (defvar splunk--request-history nil "Holds the list requests completed.")
 (defvar splunk--search-history nil "List of past searches. Elements are plists with keys :query :sid :time :results.")
@@ -453,61 +459,74 @@
       (concat (substring s 0 maxlen) "…")
     (or s "")))
 
+(defun splunk--apply-ssl-settings ()
+  "Apply SSL verification settings based on `splunk-disable-ssl-verification'."
+  (when splunk-disable-ssl-verification
+    (setq gnutls-verify-error nil)
+    (setq network-security-level 'low)
+    ;; For older Emacs versions
+    (when (boundp 'tls-checktrust)
+      (setq tls-checktrust nil))))
+
+(defun splunk-toggle-ssl-verification ()
+  "Toggle SSL certificate verification on/off."
+  (interactive)
+  (setq splunk-disable-ssl-verification (not splunk-disable-ssl-verification))
+  (splunk--apply-ssl-settings)
+  (message "SSL certificate verification %s" 
+           (if splunk-disable-ssl-verification "disabled" "enabled")))
+
 (defun splunk-login ()
   "Authenticate against Splunk and cache a session token.
-Prompts using `auth-source' if needed. Does not echo secrets."
+Prompts for credentials if not available in auth-source."
   (interactive)
-  (let* ((auth-source-creation-prompts
-          '((user . "Splunk user at %h: ")
-            (secret . "Splunk password for %u@%h: ")))
-         (cred (nth 0 (auth-source-search :max 1
-                                          :host splunk-host
-                                          :port splunk-port
-                                          :require '(:user :secret)
-                                          :create t))))
-    (unless cred
-      (user-error "No credentials available for %s:%s" splunk-host splunk-port))
-
-    (let* ((user (plist-get cred :user))
-           (secret (plist-get cred :secret))
-           (password (if (functionp secret) (funcall secret) secret))
-           (url (format "http://%s:%s/services/auth/login" splunk-host splunk-port))
-           (url-request-method "POST")
-           (url-request-extra-headers '(("Content-Type" . "application/x-www-form-urlencoded")
-                                        ("Accept" . "application/json")))
+  ;; Handle SSL verification
+  (splunk--apply-ssl-settings)
+  
+  ;; Get credentials
+  (let* ((cred (car (auth-source-search :max 1
+                                        :host splunk-host
+                                        :port splunk-port
+                                        :require '(:user :secret))))
+         (user (or (plist-get cred :user)
+                   (read-string (format "Username for %s:%s: " splunk-host splunk-port))))
+         (secret (plist-get cred :secret))
+         (password (or (if (functionp secret) (funcall secret) secret)
+                       (read-passwd (format "Password for %s@%s:%s: " user splunk-host splunk-port)))))
+    
+    ;; Make the login request
+    (let* ((url-request-method "POST")
+           (url-request-extra-headers '(("Content-Type" . "application/x-www-form-urlencoded")))
            (url-request-data (format "username=%s&password=%s&output_mode=json"
                                      (url-hexify-string user)
-                                     (url-hexify-string password))))
-      (let ((login-callback
-             (lambda (_status)
-               (let ((http-response-buffer (current-buffer)))
-                 (unwind-protect
-                     (progn
-                       (let* ((json (splunk--read-json-body))
-                              (token (or (and json (alist-get 'sessionKey json))
-                                         ;; Fallback to XML parsing if JSON fails or doesn't have sessionKey
-                                         (let* ((xml (splunk--read-xml-body))
-                                                (root (car-safe xml))
-                                                (node (and root (car (xml-get-children root 'sessionKey)))))
-                                           (and node (car (xml-node-children node)))))))
-                         (if (and token (stringp token) (not (string-empty-p token)))
-                             (progn
-                               (setq splunk-token token
-                                     splunk--auth-header (cons "Authorization" (concat "Splunk " token)))
-                               (message "Login successful for %s@%s:%s" user splunk-host splunk-port)
-                               (splunk-overview-refresh))
-                           ;; Login failed, report HTTP status and body
-                           (let* ((status (splunk--http-status))
-                                  (code (car status))
-                                  (text (cdr status))
-                                  (body (splunk--truncate splunk--last-http-body 2000)))
-                             (message "Login failed: %s %s\nBody: %s"
-                                      (or code "<unknown>") (or text "") body)))))
-                   ;; Ensure the temporary HTTP response buffer is killed
-                   (when (buffer-live-p http-response-buffer)
-                     (kill-buffer http-response-buffer)))))))
-        ;; Perform the asynchronous HTTP request
-        (url-retrieve url login-callback nil t)))))
+                                     (url-hexify-string password)))
+           (url (format "https://%s:%s/services/auth/login" splunk-host splunk-port))
+           (buffer (url-retrieve-synchronously url nil nil 10)))
+      
+      (if (not buffer)
+          (error "Failed to connect to Splunk at %s:%s" splunk-host splunk-port)
+        
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          ;; Skip HTTP headers
+          (when (re-search-forward "\r?\n\r?\n" nil t)
+            (let* ((json-object-type 'alist)
+                   (json-array-type 'list)
+                   (json-key-type 'symbol)
+                   (response (ignore-errors (json-read)))
+                   (token (and response (alist-get 'sessionKey response))))
+              
+              (kill-buffer buffer)
+              
+              (if token
+                  (progn
+                    (setq splunk-token token
+                          splunk--auth-header (cons "Authorization" (concat "Splunk " token)))
+                    (message "Login successful for %s@%s:%s" user splunk-host splunk-port)
+                    (when (fboundp 'splunk-overview-refresh)
+                      (splunk-overview-refresh))
+                    token)
+                (error "Login failed - no session key received")))))))))
 
 (defun splunk--generate-auth-header ()
   "Generate a Basic Authorization header value (string) from auth-source."
@@ -553,6 +572,8 @@ Prompts using `auth-source' if needed. Does not echo secrets."
 
 (defun splunk-create-search-job (search-query)
   (interactive "sEnter search query: ")
+  ;; Apply SSL settings
+  (splunk--apply-ssl-settings)
   (let* ((credentials (splunk--get-credentials))
          (user (plist-get (car credentials) :user))
          (secret (plist-get (car credentials) :secret))
@@ -778,6 +799,8 @@ Prompts using `auth-source' if needed. Does not echo secrets."
     (splunk--handle-results-response sid status)))
 
 (defun splunk--poll-results (sid attempt)
+  ;; Apply SSL settings
+  (splunk--apply-ssl-settings)
   (let* ((url-request-method "GET")
          (url-request-extra-headers (list (splunk--current-auth-header)
                                           (cons "Accept" "application/json")))
@@ -871,6 +894,10 @@ Prompts using `auth-source' if needed. Does not echo secrets."
       (insert (format "Port: %s\n" splunk-port))
       (insert (format "Username: %s\n" splunk-username))
       (insert (format "Auth: %s\n" (if splunk-token "token" "none")))
+      (insert (format "SSL Verification: %s\n" 
+                      (if splunk-disable-ssl-verification 
+                          (propertize "DISABLED" 'face 'warning)
+                        (propertize "enabled" 'face 'success))))
       (insert "\n")
 
       (splunk-overview-insert-servers)
@@ -941,8 +968,6 @@ Prompts using `auth-source' if needed. Does not echo secrets."
    ("s" "Run search…" splunk--run-search-with-query)
    ("p" "Search at point" splunk-create-search-job)])
 
-
-;; Testing
 (defun splunk--queries-running ()
   (interactive)
   (message "Running queries: %s" splunk--pending-requests))
@@ -978,12 +1003,12 @@ Prompts using `auth-source' if needed. Does not echo secrets."
    ("w" "Save current" splunk-hosts-save-current)]
   ["Auth/Server"
    ("H" "Change host (prompt)" splunk-change-host)
-   ("L" "Login" splunk-login)])
+   ("L" "Login" splunk-login)
+   ("V" "Toggle SSL verification" splunk-toggle-ssl-verification)])
 
 ;; Key bindings
 (define-key splunk-overview-mode-map (kbd "?") #'splunk-dispatch)
 (define-key splunk-overview-mode-map (kbd "d") #'splunk-dispatch)
-
 ;; Transient UI:1 ends here
 
 
