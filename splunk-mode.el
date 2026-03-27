@@ -724,17 +724,38 @@ LABEL is used in timeout messages."
           splunk-result-limit (or (plist-get params :limit) splunk-result-limit))
     (setq splunk--last-search-parameters (splunk--copy-search-parameters params))))
 
+(defun splunk--apply-search-backend (params)
+  "Switch to the backend recorded in search PARAMS, when present."
+  (when params
+    (let ((host (plist-get params :host))
+          (port (plist-get params :port))
+          (username (plist-get params :username)))
+      (when (and host port username)
+        (splunk--apply-server-entry host port username)))))
+
+(defun splunk--edit-search-parameters (params)
+  "Prompt for PARAMS query text and rerun it with the same settings."
+  (unless params
+    (user-error "No current search is available to edit"))
+  (splunk--apply-search-backend params)
+  (splunk--apply-search-parameters params)
+  (let* ((query (read-string "Search query: " (or (plist-get params :query) "")))
+         (updated (plist-put (splunk--copy-search-parameters params) :query query)))
+    (splunk--apply-search-parameters updated)
+    (splunk-create-search-job query)))
+
+(defun splunk--run-search-parameters (params)
+  "Rerun the search described by PARAMS."
+  (unless params
+    (user-error "No search is available on this line"))
+  (splunk--apply-search-backend params)
+  (splunk--apply-search-parameters params)
+  (splunk-create-search-job (or (plist-get params :query) "")))
+
 (defun splunk-edit-current-search ()
   "Prompt for the current search query and rerun it with existing settings."
   (interactive)
-  (let* ((params (splunk--current-search-parameters))
-         (query (and params (plist-get params :query))))
-    (unless params
-      (user-error "No current search is available to edit"))
-    (let* ((query (read-string "Search query: " (or query "")))
-           (updated (plist-put (splunk--copy-search-parameters params) :query query)))
-      (splunk--apply-search-parameters updated)
-      (splunk-create-search-job query))))
+  (splunk--edit-search-parameters (splunk--current-search-parameters)))
 
 (defun splunk-login ()
   "Authenticate against Splunk and cache a session token.
@@ -1088,6 +1109,7 @@ If a float, it is interpreted as a fraction of the frame width."
 (defvar splunk-search-view-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "1") #'splunk-edit-current-search)
+    (define-key map (kbd "q") #'splunk-close-search-window)
     (define-key map (kbd "?") #'splunk-dispatch)
     (define-key map (kbd "d") #'splunk-dispatch)
     map)
@@ -1097,6 +1119,32 @@ If a float, it is interpreted as a fraction of the frame width."
   "Minor mode for navigating and rerunning Splunk search views."
   :lighter nil
   :keymap splunk-search-view-mode-map)
+
+(defun splunk--close-buffer-window (window)
+  "Close WINDOW, or bury its buffer if it is the last live window."
+  (when (window-live-p window)
+    (let ((buffer (window-buffer window))
+          (can-delete (> (length (window-list nil 'nomini)) 1)))
+      (set-window-parameter window 'splunk-results nil)
+      (set-window-parameter window 'splunk-result-detail nil)
+      (set-window-parameter window 'splunk-overview nil)
+      (if can-delete
+          (delete-window window)
+        (when (buffer-live-p buffer)
+          (bury-buffer buffer))))))
+
+(defun splunk-close-search-window ()
+  "Close the current Splunk search-related window."
+  (interactive)
+  (let ((window (selected-window)))
+    (when (derived-mode-p 'splunk-results-mode)
+      (dolist (detail-window (cl-remove-if-not
+                              (lambda (candidate)
+                                (window-parameter candidate 'splunk-result-detail))
+                              (window-list nil 'nomini)))
+        (unless (eq detail-window window)
+          (splunk--close-buffer-window detail-window))))
+    (splunk--close-buffer-window window)))
 
 (defun splunk--set-search-view-context (params)
   "Attach search PARAMS to the current buffer and enable shared keys."
@@ -1383,11 +1431,13 @@ If a float, it is interpreted as a fraction of the frame width."
 (define-key splunk-results-mode-map (kbd "<return>") #'splunk-results-show-entry)
 (define-key splunk-results-mode-map (kbd "C-m") #'splunk-results-show-entry)
 (define-key splunk-results-mode-map (kbd "1") #'splunk-edit-current-search)
+(define-key splunk-results-mode-map (kbd "q") #'splunk-close-search-window)
 (define-key splunk-results-mode-map (kbd "o") #'splunk-results-show-entry)
 (define-key splunk-results-mode-map (kbd "v") #'splunk-results-show-entry)
 (define-key splunk-results-mode-map (kbd "s") #'splunk-results-drill-down)
 (define-key splunk-results-mode-map (kbd "C-c C-f") #'splunk-results-follow-mode)
 (define-key splunk-result-detail-mode-map (kbd "1") #'splunk-edit-current-search)
+(define-key splunk-result-detail-mode-map (kbd "q") #'splunk-close-search-window)
 (define-key splunk-result-detail-mode-map (kbd "RET") #'splunk-result-detail-drill-down)
 (define-key splunk-result-detail-mode-map (kbd "<return>") #'splunk-result-detail-drill-down)
 (define-key splunk-result-detail-mode-map (kbd "C-m") #'splunk-result-detail-drill-down)
@@ -1395,9 +1445,11 @@ If a float, it is interpreted as a fraction of the frame width."
 (with-eval-after-load 'evil
   (evil-make-intercept-map splunk-results-interaction-mode-map)
   (evil-define-key* '(normal motion) splunk-search-view-mode-map
-    (kbd "1") #'splunk-edit-current-search)
+    (kbd "1") #'splunk-edit-current-search
+    (kbd "q") #'splunk-close-search-window)
   (evil-define-key* '(normal motion) splunk-results-mode-map
     (kbd "1") #'splunk-edit-current-search
+    (kbd "q") #'splunk-close-search-window
     (kbd "RET") #'splunk-results-show-entry
     (kbd "<return>") #'splunk-results-show-entry
     (kbd "o") #'splunk-results-show-entry
@@ -1406,6 +1458,7 @@ If a float, it is interpreted as a fraction of the frame width."
     (kbd "zf") #'splunk-results-follow-mode)
   (evil-define-key* '(normal motion) splunk-result-detail-mode-map
     (kbd "1") #'splunk-edit-current-search
+    (kbd "q") #'splunk-close-search-window
     (kbd "RET") #'splunk-result-detail-drill-down
     (kbd "<return>") #'splunk-result-detail-drill-down))
 
@@ -1913,19 +1966,82 @@ status plist, and SEARCH-PARAMS is the originating search context."
   (interactive)
   (message "Running queries: %s" splunk--pending-requests))
 
+(defvar splunk-history-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'splunk-history-run-search)
+    (define-key map (kbd "<return>") #'splunk-history-run-search)
+    (define-key map (kbd "C-m") #'splunk-history-run-search)
+    (define-key map (kbd "1") #'splunk-history-edit-search)
+    (define-key map (kbd "q") #'splunk-close-search-window)
+    (define-key map (kbd "?") #'splunk-dispatch)
+    (define-key map (kbd "d") #'splunk-dispatch)
+    map)
+  "Keymap for the Splunk recent-searches buffer.")
+
+(define-derived-mode splunk-history-mode special-mode "Splunk-History"
+  "Mode for rerunning recent Splunk searches."
+  (setq-local truncate-lines t))
+
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal motion) splunk-history-mode-map
+    (kbd "1") #'splunk-history-edit-search
+    (kbd "q") #'splunk-close-search-window
+    (kbd "RET") #'splunk-history-run-search
+    (kbd "<return>") #'splunk-history-run-search))
+
+(defun splunk--history-entry-at-point ()
+  "Return the recent-search entry at point."
+  (or (get-text-property (point) 'splunk-history-entry)
+      (get-text-property (line-beginning-position) 'splunk-history-entry)))
+
+(defun splunk-history-run-search ()
+  "Rerun the recent search at point."
+  (interactive)
+  (splunk--run-search-parameters (splunk--history-entry-at-point)))
+
+(defun splunk-history-edit-search ()
+  "Edit and rerun the recent search at point."
+  (interactive)
+  (splunk--edit-search-parameters (splunk--history-entry-at-point)))
+
+(defun splunk--insert-history-entry (entry)
+  "Insert a recent search ENTRY into the current buffer."
+  (let* ((start (point))
+         (query (or (plist-get entry :query) ""))
+         (sid (or (plist-get entry :sid) "pending"))
+         (host (or (plist-get entry :host) splunk-host))
+         (port (or (plist-get entry :port) splunk-port))
+         (time (plist-get entry :time))
+         (time-text (if time
+                        (format-time-string "%Y-%m-%d %H:%M:%S" time)
+                      "unknown time"))
+         (range-text (format "%s -> %s"
+                             (or (plist-get entry :earliest) "")
+                             (or (plist-get entry :latest) ""))))
+    (insert (propertize query 'face 'default) "\n")
+    (insert (format "  %s  |  %s:%s  |  sid: %s  |  %s\n\n"
+                    time-text host port sid range-text))
+    (add-text-properties
+     start (point)
+     `(splunk-history-entry ,(splunk--copy-search-parameters entry)
+                            mouse-face highlight
+                            help-echo "RET: rerun search  1: edit search  q: close"))))
+
 (defun splunk--queries-history ()
   (interactive)
   (if (null splunk--search-history)
       (message "No searches yet")
     (let ((buf (get-buffer-create "*Splunk Recent Searches*")))
       (with-current-buffer buf
-        (erase-buffer)
-        (splunk--set-search-view-context (car splunk--search-history))
-        (insert "Recent Searches (press 1 to edit the latest search):\n\n")
-        (dolist (h splunk--search-history)
-          (insert (format "- %s  (sid: %s)\n" (plist-get h :query) (or (plist-get h :sid) "pending"))))
-        (goto-char (point-min))
-        (view-mode 1))
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (splunk-history-mode)
+          (insert "Recent Searches\n")
+          (insert "RET: rerun search  1: edit search  q: close\n\n")
+          (dolist (h splunk--search-history)
+            (splunk--insert-history-entry h))
+          (goto-char (point-min))
+          (forward-line 2)))
       (pop-to-buffer buf))))
 
 ;;;###autoload

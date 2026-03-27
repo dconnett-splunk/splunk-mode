@@ -4,6 +4,8 @@ Run Splunk searches from Emacs with `auth-source`-backed authentication, a Magit
 
 The active implementation in this repository is [`splunk-mode.el`](./splunk-mode.el). Older `pepita` files are still present for history, but they are not the current interface.
 
+This repository builds on the original work by Sebastián Monía. The project remains MIT-licensed, and the original copyright and license notice are preserved in [`LICENSE`](./LICENSE) and the source headers.
+
 ## Features
 
 - Multiple Splunk backends loaded from `auth-source`
@@ -174,9 +176,16 @@ In the detail inspector:
 - `1` edits and reruns the current search
 - `q` closes the detail window
 
-In raw, JSON, CSV, and history buffers:
+In raw and JSON/CSV buffers:
 
 - `1` edits and reruns the current search
+- `q` closes the current window
+
+In recent-search history:
+
+- `RET` reruns the search under point
+- `1` edits that saved search before rerunning it
+- `q` closes the history window
 
 ## Useful Options
 
@@ -213,3 +222,12 @@ In raw, JSON, CSV, and history buffers:
 - [`splunk-mode.el`](./splunk-mode.el) is the current source of truth.
 - [`splunk.org`](./splunk.org) is useful historical context, but it does not fully match the live implementation.
 - Legacy `pepita` files are preserved for reference and migration context.
+
+## Attribution And License
+
+- Original package author: Sebastián Monía
+- Current repository maintainer/modifier: David Connett
+- License: MIT
+- Upstream/original project reference: <https://github.com/sebasmonia/splunk>
+
+Under the MIT license, the important compliance point is to keep the copyright notice and permission notice with redistributed copies or substantial portions of the software. This README is not a substitute for legal advice, but that is the core requirement stated in the MIT license text.
