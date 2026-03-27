@@ -1,126 +1,215 @@
-[![MELPA](https://melpa.org/packages/pepita-badge.svg)](https://melpa.org/#/pepita)
+# splunk-mode
 
-# pepita
-_"Pepita": "nugget" in Spanish._
+Run Splunk searches from Emacs with `auth-source`-backed authentication, a Magit-style overview buffer, and async result views.
 
-Run a Splunk search from Emacs.
+The active implementation in this repository is [`splunk-mode.el`](./splunk-mode.el). Older `pepita` files are still present for history, but they are not the current interface.
 
-Splunk is a tool that ingests plain data (for example, logs) and makes it searchable. It exposes a REST API, which made this package possible.
-See https://www.splunk.com for more information.
+## Features
 
-**You can buy me a [cup of ko-fi](https://ko-fi.com/A0A527CN7)! There's also a [PayPal option](https://www.paypal.me/sebasmonia).**
+- Multiple Splunk backends loaded from `auth-source`
+- Interactive overview buffer and transient dispatcher
+- Async search job submission and polling
+- Table, raw, JSON, and CSV result views
+- Result drill-down from the current table cell or detail field
+- Search history and "edit current search" flow
+- Configurable request timeout and SSL verification toggle
 
-## Table of contents
+## Requirements
 
-<!--ts-->
+- A recent Emacs
+- `magit`
+- `transient`
+- `request`
+- `soap-client`
+- Access to the Splunk management API, usually on port `8089`
 
-   * [Installation and configuration](#installation-and-configuration)
-   * [Usage](#usage)
-     * [Interactive functions](#interactive-functions)
-     * [Parametrized queries](#parametrized-queries)
-     * [Splunk search parameters](#splunk-search-parameters)
-     * [Results buffer](#results-buffer)
-     * [Queries in progress and completed](#queries-in-progress-and-completed)
-     * [My workflow](#my-workflow)
+`auth-source`, `json`, and the URL libraries are built into Emacs.
 
-<!--te-->
+## Installation
 
-## Installation and configuration
+This repository is easiest to use as a local checkout while iterating on the package.
 
-Place pepita.el in your load-path. Or (preferred) install from MELPA.
+### Doom Emacs
 
-The next step would be tocall `customize-group` for pepita. Not a lot to see so far:
+Enable Doom's `:tools magit` module, or make sure `magit` is installed some other way.
 
-1. **REQUIRED**: Add the Splunk URL _(Notice the trailing /)_:
+Add the non-builtin dependencies in `~/.doom.d/packages.el`:
 
 ```elisp
-    (setq 'pepita-splunk-url "https://splunk.something.com:8089/services/")
+(package! request)
+(package! soap-client)
 ```
 
-2. You can set `pepita-splunk-username` if you don't want to enter your user name on each session
+Add the package itself in `~/.doom.d/config.el`:
 
-# Usage
+```elisp
+(add-to-list 'load-path "/path/to/splunk-mode")
 
-The first request to Splunk you will be prompted user/pass and then your credentials will be
-cached in memory as long as Emacs is open. I couldn't get session auth to work 
-yet (so that we don't need to keep credentials around anymore) but it's a feature in the roadmap.
+(use-package! splunk-mode
+  :commands (splunk-overview splunk-dispatch splunk-search-dispatch)
+  :init
+  (map! :leader
+        :desc "Splunk overview" "o s" #'splunk-overview
+        :desc "Splunk dispatch" "o S" #'splunk-dispatch)
+  :config
+  (setq splunk-auth-source-service "splunk"
+        splunk-request-timeout 30))
 
-## Interactive functions
+(defun +splunk/reload ()
+  (interactive)
+  (when (featurep 'splunk-mode)
+    (unload-feature 'splunk-mode t))
+  (load-file "/path/to/splunk-mode/splunk-mode.el"))
+```
 
-In my config, I've bound these to `<f12>` and `S-<f12>` respectively:
+Then run:
 
-* `pepita-new-search`: Prompts for a query text and time range. If called with prefix arg, 
-provides the parameters from the last search as starting point.
+```bash
+doom sync
+```
 
-* `pepita-search-at-point`: Just like the previous function, but use the region, or current
-line if region is not active, as query text. If called with prefix args, prepend the last 
-search text to the new input.
+After the first sync, normal code changes only need:
 
-I keep an org file with some common queries, in those scenarios the second function is really handy.
-It's also useful to refine a search from results (highlight the text you want to add to the query and
-call with prefix arg).
-See the next section for even more usefulness from `search-at-point`.
+```text
+M-x +splunk/reload
+```
 
-## Parametrized queries
+### Vanilla Emacs
 
-You can store parameters in a query text, and you will be prompted for replacements when using `pepita-search-at-point`.  
-This can be super handy if you are building a library of common queries. Let's say you have the following line in a text or org file:
+Install `magit`, `transient`, `request`, and `soap-client` with your preferred package manager, then load the local checkout:
 
-`index=some_application_name TheWorstExceptionEver "%%SomeText%%"  Hostname=%%The host%%`
+```elisp
+(add-to-list 'load-path "/path/to/splunk-mode")
+(require 'splunk-mode)
 
-You set the point anywhere on it, and use your binding for `pepita-search-at-point`.  
-You will be prompted "Value for parameter [SomeText]: " and then "Value for parameter [The host]: ". Finally you will see the usual query prompt, with all values replaced.
+(setq splunk-auth-source-service "splunk"
+      splunk-request-timeout 30)
+```
 
-Note that the parameters name don't matter. For each match to the regex `%%.*?%%` you will be prompted for a replacement that will be inserted literally in the query.  
-Ex. `A query %%NoName%% %%NoName%% %%NoName%%` means you will be prompted for the parameter "NoName" three times in a row.
+To reload during development:
 
-## Splunk search parameters
+```text
+M-x load-file RET /path/to/splunk-mode/splunk-mode.el
+```
 
-_Query text_: this is exactly what you would type in the search box in Splunk
+## auth-source Setup
 
-_From_: A time specification, or blank.
+The package expects credentials in `~/.authinfo.gpg`, `~/.authinfo`, or another configured `auth-source` backend.
 
-_To_: A time specification, or blank.
+Example `~/.authinfo.gpg` entries:
 
-Splunk is really flexible with the format for the last two. For the full details see https://docs.splunk.com/Documentation/Splunk/7.2.4/SearchReference/SearchTimeModifiers, but the following examples can get you started: 
+```text
+machine splunk-prod.example.com login alice port 8089 password YOUR_SECRET service splunk
+machine splunk-dev.example.com login alice port 8089 password YOUR_SECRET service splunk
+machine splunk-lab.example.com login bob port 8090 password YOUR_SECRET service splunk
+```
 
-* -5d => five days ago
-* -30m => last thirty minutes
-* 2019-01-01T14:00:00 => Jan 1st 2019 at 2 PM _ISO 8601 format_
-* From: -3h To: -10m => events from 3 hours ago up to 10 minutes ago
+Notes:
 
-## Results buffer
+- `machine` should be just the hostname. Do not include `https://` or `host:port`.
+- `service splunk` is recommended when you have multiple entries or non-default ports.
+- `splunk-hosts-sync-from-auth-source` imports `(host port username)` entries from `auth-source`.
+- If only one backend is available, search/login can auto-select it. If there are several, you will be prompted to choose.
 
-The search runs in the background, and the results are displayed in a new buffer, in CSV format. You can save the buffer and open it in Excel, for example, or load the data in SQLite.  
-You can use `C-h m` (describe-mode) to see the commands available. For convenience they are listed below:
+## First-Time Workflow
 
-* ? - to see the parameters used in the query in the echo area.
-* j - to export to JSON. You can select which fields to export (separate by comma), or leave blank to export all of them.
-* h - to export to HTML. Field selection works the same. Generates a local web page and launches your default browser. It uses https://datatables.net and you can hide columns dinamically.
-* o - to export the results as an Org table. These are easily sorted and you can remove columns within Emacs, but don't support multi line cells. Use your best judgement :)
-* t - calls `toggle-truncate-lines`. Depending on your search results truncating can be more or less convenient.
-* r - to rename the results buffer to something more meaningful. It suggests the "Splunk:" prefix.
-* g - to re-run the query in the same results buffer. Use prefix arg to edit the query before running it.
-* G - same as `g`, but will send the results to a new buffer. Useful to compare two runs of the same search, or the same query but adjusting the time span.
-* q - to quit, as in most Emacs read-only buffers.
+1. Open `M-x splunk-overview` or `M-x splunk-dispatch`.
+2. Import or add servers.
+3. Log in.
+4. Run a search.
 
-## Queries in progress and completed
+From `splunk-overview`, the built-in menu is:
 
-The command `pepita-queries-running` will open a buffer with the list of queries waiting for results. Press `g` to refresh the list.
-This is useful to keep track of complex, long running queries, without searching your buffer list for all "Splunk results" buffers.
+- `1` Search
+- `2` Recent searches
+- `3` Switch server
+- `4` Add server
+- `5` Import servers from `auth-source`
+- `6` Login
 
-Use `pepita-queries-history` to open a buffer with the list of queries that completed during the current session. RET will re-run
-the query under point and `g` will refresh the list. If you are looking at a list of results exported and want to tweak the search but
-don't have the original results buffer open to use `?`, then this mode might save the day.
+`splunk-dispatch` provides the same flow in a transient menu:
 
-## My workflow
+- Search: `S` for the search transient, `o` for overview
+- Inspect: `r` running requests, `h` history
+- Servers: add, import, switch, edit, remove, save current
+- Auth/Server: change host, login, toggle SSL verification
 
-Most of the keybindings came from my own usage (you are welcome to suggest more, and also share your own workflow to refine the functionality).  
-I keep an org file with queries that I run with `pepita-search-at-point`, a few of them are parametrized with %%. If I'm looking for error messages or API calls I use `g` to keep refreshing the results in the last 10 minutes/hour etc.  
-Sometimes once I get data, I want to filter certain fields. For example, I want to check out how many hosts ran a certain process, using `C-u G` I can add " | table _time host | dedup host" and get a separate results buffer.  
-Keep in mind using `g` or `G` with a prefix arg will allow adjusting the query and also the timespan, sometimes when hunting for something you don't modify the query but keep adding hours or days until you hit the jackpot.
+## Search Defaults
 
+The search transient `M-x splunk-search-dispatch` lets you change:
 
-Finally, until further optimization, exporting to JSON or HTML doesn't support more than 400~500 items (more if you pre-filter the fields). However, I've been able to successfully retrieve 2GB+ of results, saving the results buffer (since it is CSV) and open the files in Excel. I suppose you could also import the CSV in a database, if needed.
+- `splunk-time-earliest`
+- `splunk-time-latest`
+- `splunk-result-format`
+- `splunk-result-limit`
 
+These values are also reused when you edit or drill down from an existing search.
 
+## Result Views
+
+### Table view
+
+The default table view is optimized for common fields and not for every field a search may return.
+
+- `splunk-visible-fields` sets the preferred columns
+- `splunk-max-columns` caps how many columns are shown
+- `splunk-time-column-width` controls the `_time` width
+- multiline fields such as `_raw` are collapsed to a single line in the table
+
+When a search returns many fields, keep the table narrow and use the detail inspector or raw view for the full event.
+
+### Result keybindings
+
+In `Splunk-Results`:
+
+- `RET`, `o`, or `v` opens the detail inspector for the current row
+- `s` drills down on the table cell under point by appending `field=value` to the current search
+- `C-c C-f` enables follow mode so the detail window tracks point
+- `1` edits and reruns the current search
+- `?` or `d` opens `splunk-dispatch`
+
+In the detail inspector:
+
+- `RET` drills down on the field under point
+- `1` edits and reruns the current search
+- `q` closes the detail window
+
+In raw, JSON, CSV, and history buffers:
+
+- `1` edits and reruns the current search
+
+## Useful Options
+
+- `splunk-auth-source-service`
+  Restrict auth lookups and backend imports to a specific service, for example `"splunk"`.
+
+- `splunk-request-timeout`
+  Per-request timeout in seconds for login, search submission, and polling.
+
+- `splunk-disable-ssl-verification`
+  Disable TLS verification for self-signed Splunk deployments.
+
+- `splunk-result-detail-window-width`
+  Width of the right-side detail inspector window.
+
+- `splunk-overview-window-width`
+  Width reserved for the overview window when a results buffer is opened beside it.
+
+- `splunk-visible-fields`
+  Preferred field order for the table view.
+
+- `splunk-max-columns`
+  Maximum number of table columns to display.
+
+## Troubleshooting
+
+- If the package keeps trying `localhost:8089`, your active backend is wrong. Import or switch servers and verify your `auth-source` entry matches host, port, and user.
+- If you use a self-signed certificate, run `M-x splunk-toggle-ssl-verification`.
+- If requests are timing out, increase `splunk-request-timeout`.
+- If Emacs still has the old code loaded after an edit, reload the file instead of restarting your whole session.
+
+## Repository Notes
+
+- [`splunk-mode.el`](./splunk-mode.el) is the current source of truth.
+- [`splunk.org`](./splunk.org) is useful historical context, but it does not fully match the live implementation.
+- Legacy `pepita` files are preserved for reference and migration context.

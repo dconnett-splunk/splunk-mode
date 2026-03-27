@@ -101,6 +101,14 @@
   :type 'integer
   :group 'splunk)
 
+(defcustom splunk-result-page-size 500
+  "Number of results to fetch per page for completed searches.
+Completed jobs are fetched from Splunk a page at a time until
+`splunk-result-limit' rows have been collected.  When the result
+limit is 0 or nil, all available rows are fetched page by page."
+  :type 'integer
+  :group 'splunk)
+
 (defcustom splunk-debug nil
   "If non-nil, log HTTP responses and show debug info."
   :type 'boolean
@@ -209,6 +217,26 @@ result format, result limit, and any fetched results.")
 (defface splunk-result-detail-field-face
   '((t :inherit font-lock-variable-name-face :weight bold))
   "Face used for field labels in the Splunk result detail buffer."
+  :group 'splunk)
+
+(defface splunk-result-detail-separator-face
+  '((t :inherit shadow))
+  "Face used for separators in the Splunk result detail buffer."
+  :group 'splunk)
+
+(defface splunk-result-detail-value-face
+  '((t :inherit default))
+  "Face used for field values in the Splunk result detail buffer."
+  :group 'splunk)
+
+(defface splunk-result-detail-empty-face
+  '((t :inherit shadow :slant italic))
+  "Face used for empty field values in the Splunk result detail buffer."
+  :group 'splunk)
+
+(defface splunk-search-summary-face
+  '((t :inherit font-lock-doc-face :weight bold))
+  "Face used for rendered search summaries in Splunk buffers."
   :group 'splunk)
 
 (defun splunk--auth-source-search (&optional max require-secret)
@@ -982,17 +1010,19 @@ If a float, it is interpreted as a fraction of the frame width."
         (and (listp first)
              (mapcar (lambda (kv) (splunk--ensure-string (car kv))) first)))))))
 
+(defun splunk--displayable-field-p (field-name)
+  "Return non-nil when FIELD-NAME should be shown in fallback table mode."
+  (or (not splunk-hide-internal-fields)
+      (not (and (> (length field-name) 1)
+                (eq (aref field-name 0) ?_)
+                (not (member field-name '("_time" "_raw")))))))
+
 (defun splunk--select-display-fields (all-fields)
-  (let* ((preferred (seq-filter (lambda (f) (member f all-fields)) splunk-visible-fields))
-         (rest (seq-filter (lambda (f)
-                             (and (not (member f splunk-visible-fields))
-                                  (or (not splunk-hide-internal-fields)
-                                      (not (and (> (length f) 1)
-                                                (eq (aref f 0) ?_)
-                                                (not (member f '("_time" "_raw"))))))))
-                           all-fields))
-         (full (seq-concatenate 'list preferred rest)))
-    (cl-subseq full 0 (min (length full) splunk-max-columns))))
+  (let* ((preferred (seq-filter (lambda (f) (member f all-fields))
+                                splunk-visible-fields))
+         (fallback (seq-filter #'splunk--displayable-field-p all-fields))
+         (fields (or preferred fallback)))
+    (cl-subseq fields 0 (min (length fields) splunk-max-columns))))
 
 (defun splunk--row-for-fields (row fields)
   (vconcat (mapcar (lambda (fname)
@@ -1000,12 +1030,14 @@ If a float, it is interpreted as a fraction of the frame width."
                        (splunk--normalize-inline-text (if kv (cdr kv) ""))))
                    fields)))
 
-(defun splunk--result-row-id (row)
-  "Return a stable identifier for ROW."
+(defun splunk--result-row-id (row index)
+  "Return a unique identifier for ROW at INDEX in the current result set."
   (let ((cd (cdr (assq '_cd row))))
-    (if cd
-        (splunk--ensure-string cd)
-      (secure-hash 'sha1 (prin1-to-string row)))))
+    (format "%s:%s"
+            index
+            (if cd
+                (splunk--ensure-string cd)
+              (secure-hash 'sha1 (prin1-to-string row))))))
 
 (defun splunk--result-field-order (row)
   "Return the display order for ROW fields in the current results buffer."
@@ -1019,6 +1051,39 @@ If a float, it is interpreted as a fraction of the frame width."
   "Return FIELD-NAME from ROW as a display string."
   (let ((kv (assq (intern field-name) row)))
     (splunk--normalize-line-endings (if kv (cdr kv) ""))))
+
+(defun splunk--search-summary (params)
+  "Return a single-line summary string for search PARAMS."
+  (when params
+    (let* ((query (splunk--normalize-inline-text (or (plist-get params :query) "")))
+           (earliest (plist-get params :earliest))
+           (latest (plist-get params :latest))
+           (parts (delq nil
+                        (list
+                         (format "Search: %s"
+                                 (if (string-empty-p query) "<empty>" query))
+                         (when (or earliest latest)
+                           (format "Range: %s -> %s"
+                                   (or earliest "")
+                                   (or latest "")))))))
+      (splunk--truncate (string-join parts "  |  ") 220))))
+
+(defun splunk--search-header-line (params &optional suffix)
+  "Return a header-line string from PARAMS and optional SUFFIX."
+  (let ((summary (splunk--search-summary params)))
+    (cond
+     ((and summary suffix) (format "%s    %s" summary suffix))
+     (summary summary)
+     (suffix suffix)
+     (t nil))))
+
+(defun splunk--insert-search-summary-banner (params)
+  "Insert a visible search summary banner for PARAMS at the top of the buffer."
+  (when-let ((summary (splunk--search-summary params)))
+    (let ((inhibit-read-only t))
+      (goto-char (point-min))
+      (insert (propertize summary 'face 'splunk-search-summary-face) "\n\n"))
+    t))
 
 (defvar splunk-search-view-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1036,6 +1101,9 @@ If a float, it is interpreted as a fraction of the frame width."
 (defun splunk--set-search-view-context (params)
   "Attach search PARAMS to the current buffer and enable shared keys."
   (setq-local splunk--search-parameters (splunk--copy-search-parameters params))
+  (setq-local mode-line-process
+              (when-let ((summary (splunk--search-summary params)))
+                (format " [%s]" summary)))
   (splunk-search-view-mode 1))
 
 (define-derived-mode splunk-result-detail-mode special-mode "Splunk-Result-Detail"
@@ -1051,15 +1119,22 @@ If a float, it is interpreted as a fraction of the frame width."
 (defun splunk--insert-result-detail-field (row field-name)
   "Insert FIELD-NAME and its value from ROW into the current buffer."
   (let ((start (point))
-        (value (splunk--result-field-value row field-name)))
-    (insert (propertize (format "%s:" field-name)
+        (value (splunk--result-field-value row field-name))
+        (value-indent (make-string (+ (length field-name) 2) ?\s)))
+    (insert (propertize field-name
                         'face 'splunk-result-detail-field-face))
-    (if (string-match-p "\n" value)
-        (progn
-          (insert "\n" value)
-          (unless (string-suffix-p "\n" value)
-            (insert "\n")))
-      (insert " " value "\n"))
+    (insert (propertize ": "
+                        'face 'splunk-result-detail-separator-face))
+    (if (string-empty-p value)
+        (insert (propertize "<empty>" 'face 'splunk-result-detail-empty-face))
+      (let ((lines (split-string value "\n" nil)))
+        (insert (car lines))
+        (dolist (line (cdr lines))
+          (insert "\n"
+                  (propertize value-indent
+                              'face 'splunk-result-detail-separator-face)
+                  line))))
+    (insert "\n")
     (insert "\n")
     (add-text-properties start (point)
                          `(splunk-field-name ,field-name
@@ -1247,7 +1322,10 @@ If a float, it is interpreted as a fraction of the frame width."
           (erase-buffer)
           (splunk-result-detail-mode)
           (splunk--set-search-view-context search-params)
-          (setq-local header-line-format "RET: drill down  1: edit search  q: close")
+          (setq-local header-line-format
+                      (splunk--search-header-line
+                       search-params
+                       "RET: drill down  1: edit search  q: close"))
           (insert (format "Search SID: %s\n" sid))
           (insert (format "Row ID: %s\n\n" row-id))
           (dolist (field-name field-order)
@@ -1277,11 +1355,12 @@ If a float, it is interpreted as a fraction of the frame width."
 
 (defvar splunk-results-interaction-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") #'splunk-results-drill-down)
-    (define-key map (kbd "<return>") #'splunk-results-drill-down)
-    (define-key map (kbd "C-m") #'splunk-results-drill-down)
+    (define-key map (kbd "RET") #'splunk-results-show-entry)
+    (define-key map (kbd "<return>") #'splunk-results-show-entry)
+    (define-key map (kbd "C-m") #'splunk-results-show-entry)
     (define-key map (kbd "o") #'splunk-results-show-entry)
     (define-key map (kbd "v") #'splunk-results-show-entry)
+    (define-key map (kbd "s") #'splunk-results-drill-down)
     (define-key map (kbd "C-c C-f") #'splunk-results-follow-mode)
     map)
   "Keymap for interactive commands in `splunk-results-mode'.")
@@ -1300,25 +1379,33 @@ If a float, it is interpreted as a fraction of the frame width."
   (splunk-search-view-mode 1)
   (splunk-results-interaction-mode 1))
 
-(define-key splunk-results-mode-map (kbd "RET") #'splunk-results-drill-down)
-(define-key splunk-results-mode-map (kbd "<return>") #'splunk-results-drill-down)
-(define-key splunk-results-mode-map (kbd "C-m") #'splunk-results-drill-down)
+(define-key splunk-results-mode-map (kbd "RET") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "<return>") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "C-m") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "1") #'splunk-edit-current-search)
 (define-key splunk-results-mode-map (kbd "o") #'splunk-results-show-entry)
 (define-key splunk-results-mode-map (kbd "v") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "s") #'splunk-results-drill-down)
 (define-key splunk-results-mode-map (kbd "C-c C-f") #'splunk-results-follow-mode)
+(define-key splunk-result-detail-mode-map (kbd "1") #'splunk-edit-current-search)
 (define-key splunk-result-detail-mode-map (kbd "RET") #'splunk-result-detail-drill-down)
 (define-key splunk-result-detail-mode-map (kbd "<return>") #'splunk-result-detail-drill-down)
 (define-key splunk-result-detail-mode-map (kbd "C-m") #'splunk-result-detail-drill-down)
 
 (with-eval-after-load 'evil
   (evil-make-intercept-map splunk-results-interaction-mode-map)
+  (evil-define-key* '(normal motion) splunk-search-view-mode-map
+    (kbd "1") #'splunk-edit-current-search)
   (evil-define-key* '(normal motion) splunk-results-mode-map
-    (kbd "RET") #'splunk-results-drill-down
-    (kbd "<return>") #'splunk-results-drill-down
+    (kbd "1") #'splunk-edit-current-search
+    (kbd "RET") #'splunk-results-show-entry
+    (kbd "<return>") #'splunk-results-show-entry
     (kbd "o") #'splunk-results-show-entry
     (kbd "v") #'splunk-results-show-entry
+    (kbd "s") #'splunk-results-drill-down
     (kbd "zf") #'splunk-results-follow-mode)
   (evil-define-key* '(normal motion) splunk-result-detail-mode-map
+    (kbd "1") #'splunk-edit-current-search
     (kbd "RET") #'splunk-result-detail-drill-down
     (kbd "<return>") #'splunk-result-detail-drill-down))
 
@@ -1343,12 +1430,13 @@ If a float, it is interpreted as a fraction of the frame width."
                                    fields))
              (columns (apply 'vector columns-list))
              (row-map (make-hash-table :test #'equal))
-             (entries (mapcar (lambda (row)
-                                (let ((row-id (splunk--result-row-id row)))
+             (entries (cl-mapcar (lambda (row index)
+                                   (let ((row-id (splunk--result-row-id row index)))
                                   (puthash row-id row row-map)
                                   (list row-id
                                         (splunk--row-for-fields row fields))))
-                              results)))
+                               results
+                               (number-sequence 0 (1- (length results))))))
         (splunk-results-mode)
         (splunk--set-search-view-context search-params)
         (setq tabulated-list-format columns
@@ -1358,8 +1446,13 @@ If a float, it is interpreted as a fraction of the frame width."
         (setq-local splunk--results-sid sid)
         (tabulated-list-init-header)
         (tabulated-list-print t)
+        (let ((inserted-summary (splunk--insert-search-summary-banner search-params)))
+          (goto-char (point-min))
+          (when inserted-summary
+            (forward-line 2)))
         (font-lock-ensure)
-        (goto-char (point-min))))
+        (unless (tabulated-list-get-id)
+          (goto-char (point-min)))))
     (splunk--display-results-buffer buf)))
 
 (defun splunk--render-results-raw (sid results-json &optional search-params)
@@ -1368,6 +1461,7 @@ If a float, it is interpreted as a fraction of the frame width."
     (with-current-buffer buf
       (erase-buffer)
       (splunk--set-search-view-context search-params)
+      (setq-local header-line-format (splunk--search-header-line search-params))
       (let ((inhibit-message t))
         (dolist (row results)
           (let ((raw (cdr (assq '_raw row))))
@@ -1384,6 +1478,7 @@ If a float, it is interpreted as a fraction of the frame width."
        (with-current-buffer buf
          (erase-buffer)
          (splunk--set-search-view-context search-params)
+         (setq-local header-line-format (splunk--search-header-line search-params))
          (insert (pp-to-string results-json))
          (goto-char (point-min))
          (view-mode 1))
@@ -1396,6 +1491,7 @@ If a float, it is interpreted as a fraction of the frame width."
        (with-current-buffer buf
          (erase-buffer)
          (splunk--set-search-view-context search-params)
+         (setq-local header-line-format (splunk--search-header-line search-params))
          (insert (mapconcat #'identity fields ",") "\n")
          (dolist (row results)
            (insert (mapconcat (lambda (f)
@@ -1414,6 +1510,155 @@ If a float, it is interpreted as a fraction of the frame width."
     ('raw (splunk--render-results-raw sid results-json search-params))
     (_ (splunk--render-results-tabulated sid results-json search-params)))))
 
+(defun splunk--search-result-limit (&optional search-params)
+  "Return the effective result limit for SEARCH-PARAMS."
+  (let ((limit (plist-get search-params :limit)))
+    (if (numberp limit)
+        limit
+      splunk-result-limit)))
+
+(defun splunk--result-page-count (offset &optional search-params)
+  "Return how many results to request starting at OFFSET."
+  (let* ((limit (splunk--search-result-limit search-params))
+         (page-size (max 1 splunk-result-page-size)))
+    (if (and (numberp limit) (> limit 0))
+        (max 0 (min page-size (- limit offset)))
+      page-size)))
+
+(defun splunk--replace-json-results (json results)
+  "Return JSON with its `results' field replaced by RESULTS."
+  (let ((copy (copy-tree (or json '()))))
+    (if-let ((results-cell (assq 'results copy)))
+        (setcdr results-cell results)
+      (push (cons 'results results) copy))
+    (if-let ((preview-cell (assq 'preview copy)))
+        (setcdr preview-cell :json-false)
+      (push (cons 'preview :json-false) copy))
+    copy))
+
+(defun splunk--append-results-page (accumulator page-json)
+  "Append PAGE-JSON results into ACCUMULATOR and return the merged JSON."
+  (let* ((page-results (copy-tree (alist-get 'results page-json)))
+         (base (or accumulator (copy-tree page-json)))
+         (results-cell (assq 'results base)))
+    (cond
+     (results-cell
+      (if (cdr results-cell)
+          (setcdr results-cell (nconc (cdr results-cell) page-results))
+        (setcdr results-cell page-results)))
+     (t
+      (push (cons 'results page-results) base)))
+    (let ((preview-cell (assq 'preview base)))
+      (if preview-cell
+          (setcdr preview-cell :json-false)
+        (push (cons 'preview :json-false) base)))
+    base))
+
+(defun splunk--finalize-results (sid results-json &optional search-params)
+  "Render RESULTS-JSON for SID and update search history."
+  (let ((updated (when search-params
+                   (let ((entry (splunk--copy-search-parameters search-params)))
+                     (setq entry (plist-put entry :sid sid))
+                     (setq entry (plist-put entry :results results-json))
+                     entry))))
+    (splunk--render-results-buffer sid results-json updated)
+    (when updated
+      (splunk--update-search-history-entry
+       (plist-get updated :request-id)
+       (lambda (entry)
+         (setq entry (plist-put entry :sid sid))
+         (plist-put entry :results results-json)))
+      (splunk--maybe-update-last-search-parameters updated))
+    (when splunk-debug
+      (let ((results (alist-get 'results results-json)))
+        (message (if results
+                     (format "Search complete: %s (%d result%s)"
+                             sid
+                             (length results)
+                             (if (= (length results) 1) "" "s"))
+                   (format "Search complete: %s (0 results)" sid)))))))
+
+(defun splunk--handle-final-results-response (sid offset accumulator status &optional search-params)
+  "Handle a completed-results page for SID at OFFSET.
+ACCUMULATOR contains previously fetched pages.  STATUS is the url callback
+status plist, and SEARCH-PARAMS is the originating search context."
+  (let ((http-buf (current-buffer)))
+    (unwind-protect
+        (let* ((json (splunk--read-json-body))
+               (http-status (splunk--http-status))
+               (code (car http-status))
+               (text (cdr http-status))
+               (transport-error (splunk--format-callback-error status))
+               (body (splunk--truncate splunk--last-http-body 2000))
+               (has-results-key (and json (assq 'results json)))
+               (page-results (and has-results-key (alist-get 'results json)))
+               (page-count (length (or page-results '()))))
+          (cond
+           ((or (and code (>= code 400))
+                transport-error)
+            (message "%s"
+                     (concat
+                      (format "Final results retrieval failed at offset %d: %s%s"
+                              offset
+                              (if code (number-to-string code) "<unknown>")
+                              (if (and text (not (string-empty-p text)))
+                                  (concat " " text)
+                                ""))
+                      (if transport-error
+                          (format "\nTransport: %s" transport-error)
+                        "")
+                      (if (and body (not (string-empty-p body)))
+                          (format "\nBody: %s" body)
+                        ""))))
+           ((not has-results-key)
+            (message "Final results retrieval failed at offset %d: missing results payload" offset))
+           (t
+            (let* ((merged (splunk--append-results-page accumulator json))
+                   (next-offset (+ offset page-count))
+                   (limit (splunk--search-result-limit search-params))
+                   (done (or (= page-count 0)
+                             (and (numberp limit)
+                                  (> limit 0)
+                                  (>= next-offset limit)))))
+              (if done
+                  (splunk--finalize-results sid merged search-params)
+                (splunk--fetch-final-results-page
+                 sid next-offset merged search-params))))))
+      (when (buffer-live-p http-buf)
+        (kill-buffer http-buf)))))
+
+(defun splunk--handle-final-results-response-cb (status &rest cbargs)
+  (let ((sid (nth 0 cbargs))
+        (offset (nth 1 cbargs))
+        (accumulator (nth 2 cbargs))
+        (search-params (nth 3 cbargs)))
+    (splunk--handle-final-results-response
+     sid offset accumulator status search-params)))
+
+(defun splunk--fetch-final-results-page (sid offset accumulator &optional search-params)
+  "Fetch a page of completed results for SID starting at OFFSET."
+  ;; Apply SSL settings
+  (splunk--apply-ssl-settings)
+  (let ((count (splunk--result-page-count offset search-params)))
+    (if (<= count 0)
+        (splunk--finalize-results
+         sid
+         (or accumulator
+             (splunk--replace-json-results nil nil))
+         search-params)
+      (let* ((url-request-method "GET")
+             (url-request-extra-headers (list (splunk--current-auth-header)
+                                              (cons "Accept" "application/json")))
+             (url (format
+                   "https://%s:%s/services/search/jobs/%s/results/?output_mode=json&count=%s&offset=%s"
+                   splunk-host splunk-port sid count offset)))
+        (splunk--url-retrieve-with-timeout
+         url
+         #'splunk--handle-final-results-response-cb
+         (list sid offset accumulator search-params)
+         t
+         (format "Final results request for SID %s (offset %d)" sid offset))))))
+
 (defun splunk--handle-results-response (sid _status &optional search-params)
   (let ((http-buf (current-buffer)))
     (unwind-protect
@@ -1427,23 +1672,7 @@ If a float, it is interpreted as a fraction of the frame width."
           (cond
            ;; Final response (preview=false) with results key present (may be empty)
            ((and has-results-key (eq preview :json-false))
-            (let ((updated (when search-params
-                             (let ((entry (splunk--copy-search-parameters search-params)))
-                               (setq entry (plist-put entry :sid sid))
-                               (setq entry (plist-put entry :results json))
-                               entry))))
-              (splunk--render-results-buffer sid json updated)
-              (when updated
-                (splunk--update-search-history-entry
-                 (plist-get updated :request-id)
-                 (lambda (entry)
-                   (setq entry (plist-put entry :sid sid))
-                   (plist-put entry :results json)))
-                (splunk--maybe-update-last-search-parameters updated)))
-            (when splunk-debug
-              (message (if results
-                           (format "Search complete: %s (%d result%s)" sid (length results) (if (= (length results) 1) "" "s"))
-                         (format "Search complete: %s (0 results)" sid)))))
+            (splunk--fetch-final-results-page sid 0 nil search-params))
            ;; Not final yet → keep polling, unless we got an HTTP error (e.g., 502/503 with empty body)
            (t
            (let ((status (splunk--http-status)))
@@ -1464,7 +1693,7 @@ If a float, it is interpreted as a fraction of the frame width."
   (let* ((url-request-method "GET")
          (url-request-extra-headers (list (splunk--current-auth-header)
                                           (cons "Accept" "application/json")))
-         (result-limit (or (plist-get search-params :limit) splunk-result-limit))
+         (result-limit (max 1 (splunk--result-page-count 0 search-params)))
          ;; `results_preview` is the endpoint that returns intermediate results
          ;; while a job is still running; when preview becomes false the payload
          ;; is equivalent to final results.
