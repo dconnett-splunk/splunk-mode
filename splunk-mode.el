@@ -44,6 +44,7 @@
 (require 'cl-lib)
 (require 'soap-client)
 (require 'request)
+(require 'auth-source)
 (require 'json)
 (require 'url-parse)
 (require 'url-util)
@@ -160,6 +161,21 @@ Useful for self-signed certificates. WARNING: This reduces security!"
   :type 'boolean
   :group 'splunk)
 
+(defcustom splunk-request-timeout 15
+  "Maximum number of seconds to wait for a single Splunk HTTP request.
+Applies to synchronous login requests and each asynchronous search
+submission/results request.  Nil disables the timeout."
+  :type '(choice (const :tag "No timeout" nil)
+                 integer)
+  :group 'splunk)
+
+(defcustom splunk-auth-source-service nil
+  "Optional auth-source service name used for Splunk credential lookups.
+When non-nil, restrict auth-source matches to this service."
+  :type '(choice (const :tag "Any service" nil)
+                 string)
+  :group 'splunk)
+
 (defvar splunk--pending-requests (make-vector 20 nil) "Holds data for the pending requests.")
 (defvar splunk--request-history nil "Holds the list requests completed.")
 (defvar splunk--search-history nil "List of past searches. Elements are plists with keys :query :sid :time :results.")
@@ -167,7 +183,25 @@ Useful for self-signed certificates. WARNING: This reduces security!"
 (defvar splunk--last-search-parameters nil)
 (defvar splunk--last-http-headers nil)
 (defvar splunk--last-http-body nil)
+(defvar-local splunk--request-timeout-timer nil)
+(defvar-local splunk--request-timed-out nil)
 ;; Variables:1 ends here
+
+(defun splunk--auth-source-search (&optional max require-secret)
+  "Return auth-source entries for the current Splunk target.
+If MAX is nil, search for one entry.  If REQUIRE-SECRET is non-nil,
+require both user and secret fields."
+  (let ((args (list :max (or max 1)
+                    :host splunk-host
+                    :port splunk-port)))
+    (when (and splunk-username (not (string-empty-p splunk-username)))
+      (setq args (append args (list :user splunk-username))))
+    (when (and splunk-auth-source-service
+               (not (string-empty-p splunk-auth-source-service)))
+      (setq args (append args (list :service splunk-auth-source-service))))
+    (when require-secret
+      (setq args (append args (list :require '(:user :secret)))))
+    (apply #'auth-source-search args)))
 
 ;; [[file:splunk.org::*Basic URL Stuff and HTTP Request Stuff][Basic URL Stuff and HTTP Request Stuff:1]]
 ;; Create splunk url from host, port and endpoint
@@ -274,6 +308,40 @@ Useful for self-signed certificates. WARNING: This reduces security!"
     (customize-save-variable 'splunk-hosts splunk-hosts)
     (message "Saved server: %s" (splunk--format-host-entry entry))))
 
+(defun splunk-hosts-sync-from-auth-source ()
+  "Replace `splunk-hosts` with entries discovered in auth-source.
+When `splunk-auth-source-service` is non-nil, import all entries
+matching that service and use their stored ports.  Otherwise,
+match entries by the current `splunk-port`."
+  (interactive)
+  (let ((args (list :max 1000))
+        (seen (make-hash-table :test #'equal))
+        entries
+        hosts)
+    (when (and splunk-auth-source-service
+               (not (string-empty-p splunk-auth-source-service)))
+      (setq args (append args (list :service splunk-auth-source-service))))
+    (unless (and splunk-auth-source-service
+                 (not (string-empty-p splunk-auth-source-service)))
+      (setq args (append args (list :port splunk-port))))
+    (setq args (append args (list :require '(:host :user))))
+    (setq entries (apply #'auth-source-search args))
+    (dolist (entry entries)
+      (let* ((host (plist-get entry :host))
+             (port (plist-get entry :port))
+             (username (plist-get entry :user))
+             (port-str (and port (format "%s" port)))
+             (candidate (and host port-str username
+                             (list host port-str username))))
+        (when (and candidate (not (gethash candidate seen)))
+          (puthash candidate t seen)
+          (push candidate hosts))))
+    (setq splunk-hosts (nreverse hosts))
+    (customize-save-variable 'splunk-hosts splunk-hosts)
+    (message "Loaded %d Splunk backend%s from auth-source"
+             (length splunk-hosts)
+             (if (= (length splunk-hosts) 1) "" "s"))))
+
 (defun splunk-hosts--select-entry (prompt)
   (let* ((candidates (mapcar (lambda (e) (cons (splunk--format-host-entry e) e)) splunk-hosts))
          (choice (completing-read prompt (mapcar #'car candidates) nil t)))
@@ -308,6 +376,36 @@ Useful for self-signed certificates. WARNING: This reduces security!"
         (username (nth 2 entry)))
     (splunk--apply-server-entry host port username)
     (message "Switched to %s" (splunk--format-host-entry entry))))
+
+(defun splunk--ensure-current-backend ()
+  "Ensure the active backend is aligned with auth-source.
+If the current host/user/port has no matching credential, try to
+bootstrap `splunk-hosts` from auth-source.  When exactly one backend
+is found, select it automatically; otherwise prompt the user."
+  (unless (car (splunk--auth-source-search 1 t))
+    (when (or (null splunk-hosts)
+              (string= splunk-host "localhost"))
+      (splunk-hosts-sync-from-auth-source))
+    (cond
+     ((car (splunk--auth-source-search 1 t))
+      t)
+     ((null splunk-hosts)
+      (user-error "No Splunk backend found in auth-source%s"
+                  (if (and splunk-auth-source-service
+                           (not (string-empty-p splunk-auth-source-service)))
+                      (format " for service %s" splunk-auth-source-service)
+                    (format " for port %s" splunk-port))))
+     ((= (length splunk-hosts) 1)
+      (splunk--switch-to-entry (car splunk-hosts)))
+     (t
+      (call-interactively #'splunk-hosts-switch))))
+  (unless (car (splunk--auth-source-search 1 t))
+    (user-error "No auth-source credential found for %s:%s%s"
+                splunk-host
+                splunk-port
+                (if (and splunk-username (not (string-empty-p splunk-username)))
+                    (format " user %s" splunk-username)
+                  ""))))
 
 (defun splunk-hosts-save-current ()
   "Save current `splunk-host`, `splunk-port`, `splunk-username` to `splunk-hosts` if not present."
@@ -381,11 +479,7 @@ Useful for self-signed certificates. WARNING: This reduces security!"
 
 ;; Use this function for now, too complicated to genericize it for now
 (defun splunk--get-credentials ()
-  (let* ((credentials (auth-source-search
-                       :host splunk-host
-                       :port splunk-port
-                       :require '(:user :secret)
-                       :max 1)))
+  (let* ((credentials (splunk--auth-source-search 1 t)))
     credentials))
 
 (defun splunk-prompt-select-host (credentials)
@@ -459,6 +553,55 @@ Useful for self-signed certificates. WARNING: This reduces security!"
       (concat (substring s 0 maxlen) "…")
     (or s "")))
 
+(defun splunk--format-callback-error (status)
+  "Return a readable transport error string from url STATUS, or nil."
+  (let ((err (plist-get status :error)))
+    (when err
+      (format "%S" err))))
+
+(defun splunk--cancel-request-timeout ()
+  "Cancel the current buffer's request timeout timer, if present."
+  (when (timerp splunk--request-timeout-timer)
+    (cancel-timer splunk--request-timeout-timer))
+  (setq splunk--request-timeout-timer nil))
+
+(defun splunk--request-timeout-fired (buffer label timeout)
+  "Abort BUFFER after TIMEOUT seconds and report LABEL."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local splunk--request-timed-out t)
+      (splunk--cancel-request-timeout))
+    (let ((proc (get-buffer-process buffer)))
+      (when (process-live-p proc)
+        (delete-process proc)))
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))
+    (message "%s timed out after %ss" label timeout)))
+
+(defun splunk--url-retrieve-dispatch (status callback cbargs)
+  "Dispatch async url STATUS to CALLBACK with CBARGS, honoring timeouts."
+  (let ((timed-out splunk--request-timed-out))
+    (splunk--cancel-request-timeout)
+    (unless timed-out
+      (apply callback status cbargs))))
+
+(defun splunk--url-retrieve-with-timeout (url callback &optional cbargs silent label)
+  "Call `url-retrieve' for URL and enforce `splunk-request-timeout'.
+CALLBACK and CBARGS follow `url-retrieve'.  SILENT is passed through.
+LABEL is used in timeout messages."
+  (let ((buffer (url-retrieve url #'splunk--url-retrieve-dispatch
+                              (list callback cbargs) silent)))
+    (when (and buffer splunk-request-timeout (> splunk-request-timeout 0))
+      (with-current-buffer buffer
+        (setq-local splunk--request-timed-out nil)
+        (setq-local splunk--request-timeout-timer
+                    (run-at-time splunk-request-timeout nil
+                                 #'splunk--request-timeout-fired
+                                 buffer
+                                 (or label url)
+                                 splunk-request-timeout))))
+    buffer))
+
 (defun splunk--apply-ssl-settings ()
   "Apply SSL verification settings based on `splunk-disable-ssl-verification'."
   (when splunk-disable-ssl-verification
@@ -482,12 +625,10 @@ Prompts for credentials if not available in auth-source."
   (interactive)
   ;; Handle SSL verification
   (splunk--apply-ssl-settings)
+  (splunk--ensure-current-backend)
   
   ;; Get credentials
-  (let* ((cred (car (auth-source-search :max 1
-                                        :host splunk-host
-                                        :port splunk-port
-                                        :require '(:user :secret))))
+  (let* ((cred (car (splunk--auth-source-search 1 t)))
          (user (or (plist-get cred :user)
                    (read-string (format "Username for %s:%s: " splunk-host splunk-port))))
          (secret (plist-get cred :secret))
@@ -501,7 +642,7 @@ Prompts for credentials if not available in auth-source."
                                      (url-hexify-string user)
                                      (url-hexify-string password)))
            (url (format "https://%s:%s/services/auth/login" splunk-host splunk-port))
-           (buffer (url-retrieve-synchronously url nil nil 10)))
+           (buffer (url-retrieve-synchronously url nil nil splunk-request-timeout)))
       
       (if (not buffer)
           (error "Failed to connect to Splunk at %s:%s" splunk-host splunk-port)
@@ -539,8 +680,7 @@ Prompts for credentials if not available in auth-source."
     (when (and user password)
       (concat "Basic " (base64-encode-string (concat user ":" password))))))
 
-(defun splunk-create-search-job-callback (status &rest _cbargs)
-  (ignore status)
+(defun splunk-create-search-job-callback (cb-status &rest _cbargs)
   (let ((http-buf (current-buffer)))
     (unwind-protect
         (let* ((json (splunk--read-json-body))
@@ -554,15 +694,27 @@ Prompts for credentials if not available in auth-source."
             (message "[splunk] job create body: %s" (or splunk--last-http-body "<none>")))
           (cond
            ((and sid (not (string-empty-p sid)))
-            (message "Search submitted. SID=%s" sid)
+           (message "Search submitted. SID=%s" sid)
             (splunk--poll-results sid 0))
            (t
-            (let* ((status (splunk--http-status))
-                   (code (car status))
-                   (text (cdr status))
+            (let* ((http-status (splunk--http-status))
+                   (code (car http-status))
+                   (text (cdr http-status))
+                   (transport-error (splunk--format-callback-error cb-status))
                    (body (splunk--truncate splunk--last-http-body 2000)))
-              (message "Search job creation failed: %s %s\nBody: %s"
-                       (or code "<unknown>") (or text "") body)))))
+              (message "%s"
+                       (concat
+                        (format "Search job creation failed: %s%s"
+                                (if code (number-to-string code) "<unknown>")
+                                (if (and text (not (string-empty-p text)))
+                                    (concat " " text)
+                                  ""))
+                        (if transport-error
+                            (format "\nTransport: %s" transport-error)
+                          "")
+                        (if (and body (not (string-empty-p body)))
+                            (format "\nBody: %s" body)
+                          "")))))))
       (when (buffer-live-p http-buf)
         (kill-buffer http-buf)))))
 
@@ -574,9 +726,18 @@ Prompts for credentials if not available in auth-source."
   (interactive "sEnter search query: ")
   ;; Apply SSL settings
   (splunk--apply-ssl-settings)
+  (splunk--ensure-current-backend)
   (let* ((credentials (splunk--get-credentials))
-         (user (plist-get (car credentials) :user))
-         (secret (plist-get (car credentials) :secret))
+         (cred (car credentials))
+         (_ (unless cred
+              (user-error "No auth-source credential found for %s:%s%s"
+                          splunk-host
+                          splunk-port
+                          (if (and splunk-username (not (string-empty-p splunk-username)))
+                              (format " user %s" splunk-username)
+                            ""))))
+         (user (plist-get cred :user))
+         (secret (plist-get cred :secret))
          (password (if (functionp secret) (funcall secret) secret))
          (url (format "https://%s:%s/services/search/jobs" splunk-host splunk-port))
          (url-user-and-password (format "%s:%s" user password))
@@ -599,7 +760,13 @@ Prompts for credentials if not available in auth-source."
                                              "output_mode=json"))
                                       "&")))
     (push (list :query search-query :time (current-time)) splunk--search-history)
-    (url-retrieve url #'splunk-create-search-job-callback nil t)))
+    (splunk--url-retrieve-with-timeout url
+                                       #'splunk-create-search-job-callback
+                                       nil
+                                       t
+                                       (format "Search submission to %s:%s"
+                                               splunk-host
+                                               splunk-port))))
 
 (defun splunk--current-auth-header ()
   "Return a cons cell suitable for `url-request-extra-headers` Authorization."
@@ -804,8 +971,16 @@ Prompts for credentials if not available in auth-source."
   (let* ((url-request-method "GET")
          (url-request-extra-headers (list (splunk--current-auth-header)
                                           (cons "Accept" "application/json")))
-         (url (format "https://%s:%s/services/search/jobs/%s/results?output_mode=json&count=%s" splunk-host splunk-port sid splunk-result-limit)))
-    (url-retrieve url #'splunk--handle-results-response-cb (list sid) t)))
+         ;; `results_preview` is the endpoint that returns intermediate results
+         ;; while a job is still running; when preview becomes false the payload
+         ;; is equivalent to final results.
+         (url (format "https://%s:%s/services/search/jobs/%s/results_preview/?output_mode=json&count=%s"
+                      splunk-host splunk-port sid splunk-result-limit)))
+    (splunk--url-retrieve-with-timeout url
+                                       #'splunk--handle-results-response-cb
+                                       (list sid)
+                                       t
+                                       (format "Results preview request for SID %s" sid))))
 
 (defun splunk-request (method endpoint params)
   (let* ((url (format "https://%s:%d%s" splunk-host splunk-port endpoint))
@@ -840,10 +1015,40 @@ Prompts for credentials if not available in auth-source."
   "Major mode for interacting with Splunk."
   (read-only-mode -1))
 
-(defun splunk-overview-placeholder ()
-  "Placeholder function for unimplemented menu actions."
+(defun splunk-overview-run-action (fn)
+  "Run FN interactively and refresh the overview buffer."
+  (call-interactively fn)
+  (splunk-overview-refresh))
+
+(defun splunk-overview-run-search ()
+  "Run a Splunk search from the overview buffer."
   (interactive)
-  (splunk-overview))
+  (call-interactively #'splunk-create-search-job))
+
+(defun splunk-overview-recent-searches ()
+  "Show recent searches from the overview buffer."
+  (interactive)
+  (call-interactively #'splunk--queries-history))
+
+(defun splunk-overview-switch-server ()
+  "Switch the active Splunk backend from the overview buffer."
+  (interactive)
+  (splunk-overview-run-action #'splunk-hosts-switch))
+
+(defun splunk-overview-add-server ()
+  "Add a Splunk backend from the overview buffer."
+  (interactive)
+  (splunk-overview-run-action #'splunk-hosts-add))
+
+(defun splunk-overview-import-servers ()
+  "Import Splunk backends from auth-source."
+  (interactive)
+  (splunk-overview-run-action #'splunk-hosts-sync-from-auth-source))
+
+(defun splunk-overview-login ()
+  "Authenticate to the active Splunk backend from the overview buffer."
+  (interactive)
+  (splunk-overview-run-action #'splunk-login))
 
 (defun splunk-overview (&optional successor)
   "Display the Splunk overview buffer and optionally navigate to a specific section."
@@ -880,9 +1085,12 @@ Prompts for credentials if not available in auth-source."
           (run-hooks 'splunk-overview-sections-hook)
           (insert "Welcome to Splunk Overview.\n"))))))
 
-(define-key splunk-overview-mode-map (kbd "1") 'splunk-create-search-job)
-(define-key splunk-overview-mode-map (kbd "2") 'splunk-overview-placeholder)
-(define-key splunk-overview-mode-map (kbd "3") 'splunk-overview-placeholder)
+(define-key splunk-overview-mode-map (kbd "1") #'splunk-overview-run-search)
+(define-key splunk-overview-mode-map (kbd "2") #'splunk-overview-recent-searches)
+(define-key splunk-overview-mode-map (kbd "3") #'splunk-overview-switch-server)
+(define-key splunk-overview-mode-map (kbd "4") #'splunk-overview-add-server)
+(define-key splunk-overview-mode-map (kbd "5") #'splunk-overview-import-servers)
+(define-key splunk-overview-mode-map (kbd "6") #'splunk-overview-login)
 
 (defun splunk-overview-insert-menu ()
   "Insert the menu section in the Splunk overview buffer."
@@ -898,17 +1106,27 @@ Prompts for credentials if not available in auth-source."
                       (if splunk-disable-ssl-verification 
                           (propertize "DISABLED" 'face 'warning)
                         (propertize "enabled" 'face 'success))))
+      (insert (format "Request Timeout: %s\n"
+                      (if splunk-request-timeout
+                          (format "%ss" splunk-request-timeout)
+                        "disabled")))
       (insert "\n")
 
       (splunk-overview-insert-servers)
 
       (magit-insert-heading "Menu:")
       (magit-insert-section (search nil)
-        (insert "1. Search (press d → s → s)\n"))
+        (insert "1. Search\n"))
       (magit-insert-section (recent-searches nil)
-        (insert "2. Recent Searches (TBD)\n"))
-      (magit-insert-section (configure nil)
-        (insert "3. Configure (TBD)\n"))
+        (insert "2. Recent searches\n"))
+      (magit-insert-section (switch-server nil)
+        (insert "3. Switch server\n"))
+      (magit-insert-section (add-server nil)
+        (insert "4. Add server\n"))
+      (magit-insert-section (import-servers nil)
+        (insert "5. Import servers from auth-source\n"))
+      (magit-insert-section (login nil)
+        (insert "6. Login\n"))
       (insert "\n"))))
 
 (add-hook 'splunk-overview-sections-hook 'splunk-overview-insert-menu)
@@ -997,6 +1215,7 @@ Prompts for credentials if not available in auth-source."
    ("h" "History" splunk--queries-history)]
   ["Servers"
    ("a" "Add server" splunk-hosts-add)
+   ("i" "Import auth-source" splunk-hosts-sync-from-auth-source)
    ("s" "Switch server" splunk-hosts-switch)
    ("e" "Edit server" splunk-hosts-edit)
    ("x" "Remove server" splunk-hosts-remove)
