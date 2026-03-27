@@ -131,6 +131,11 @@
   :type 'integer
   :group 'splunk)
 
+(defcustom splunk-time-column-width 28
+  "Preferred width for the `_time` column in tabular results."
+  :type 'integer
+  :group 'splunk)
+
 ;; list of all hosts stored by user
 (defcustom splunk-hosts nil
   "List of all hosts stored by user"
@@ -178,14 +183,33 @@ When non-nil, restrict auth-source matches to this service."
 
 (defvar splunk--pending-requests (make-vector 20 nil) "Holds data for the pending requests.")
 (defvar splunk--request-history nil "Holds the list requests completed.")
-(defvar splunk--search-history nil "List of past searches. Elements are plists with keys :query :sid :time :results.")
+(defvar splunk--search-history nil
+  "List of past searches.
+Elements are plists describing the query, request id, SID, time range,
+result format, result limit, and any fetched results.")
 (defvar splunk--auth-header nil "Cached credentials for Splunk.")
 (defvar splunk--last-search-parameters nil)
+(defvar splunk--search-sequence 0)
 (defvar splunk--last-http-headers nil)
 (defvar splunk--last-http-body nil)
 (defvar-local splunk--request-timeout-timer nil)
 (defvar-local splunk--request-timed-out nil)
 ;; Variables:1 ends here
+
+(defface splunk-results-address-face
+  '((t :inherit font-lock-constant-face))
+  "Face used for IP addresses in Splunk result buffers."
+  :group 'splunk)
+
+(defface splunk-results-mac-face
+  '((t :inherit font-lock-builtin-face))
+  "Face used for MAC addresses in Splunk result buffers."
+  :group 'splunk)
+
+(defface splunk-result-detail-field-face
+  '((t :inherit font-lock-variable-name-face :weight bold))
+  "Face used for field labels in the Splunk result detail buffer."
+  :group 'splunk)
 
 (defun splunk--auth-source-search (&optional max require-secret)
   "Return auth-source entries for the current Splunk target.
@@ -619,6 +643,71 @@ LABEL is used in timeout messages."
   (message "SSL certificate verification %s" 
            (if splunk-disable-ssl-verification "disabled" "enabled")))
 
+(defun splunk--copy-search-parameters (params)
+  "Return a copy of search parameter plist PARAMS."
+  (and params (copy-tree params)))
+
+(defun splunk--build-search-parameters (search-query)
+  "Capture the current search settings for SEARCH-QUERY."
+  (list :request-id (cl-incf splunk--search-sequence)
+        :query search-query
+        :earliest splunk-time-earliest
+        :latest splunk-time-latest
+        :format splunk-result-format
+        :limit splunk-result-limit
+        :host splunk-host
+        :port splunk-port
+        :username splunk-username
+        :time (current-time)))
+
+(defun splunk--update-search-history-entry (request-id updater)
+  "Apply UPDATER to the search history entry identified by REQUEST-ID."
+  (when request-id
+    (setq splunk--search-history
+          (mapcar (lambda (entry)
+                    (if (equal (plist-get entry :request-id) request-id)
+                        (funcall updater (splunk--copy-search-parameters entry))
+                      entry))
+                  splunk--search-history))))
+
+(defun splunk--maybe-update-last-search-parameters (params)
+  "Replace `splunk--last-search-parameters' with PARAMS when they match."
+  (let ((request-id (plist-get params :request-id)))
+    (when (and request-id
+               splunk--last-search-parameters
+               (equal request-id
+                      (plist-get splunk--last-search-parameters :request-id)))
+      (setq splunk--last-search-parameters
+            (splunk--copy-search-parameters params)))))
+
+(defun splunk--current-search-parameters ()
+  "Return the search parameters associated with the current Splunk buffer."
+  (or (and (boundp 'splunk--search-parameters)
+           (splunk--copy-search-parameters splunk--search-parameters))
+      (splunk--copy-search-parameters splunk--last-search-parameters)
+      (splunk--copy-search-parameters (car splunk--search-history))))
+
+(defun splunk--apply-search-parameters (params)
+  "Apply PARAMS as the current default search settings."
+  (when params
+    (setq splunk-time-earliest (or (plist-get params :earliest) splunk-time-earliest)
+          splunk-time-latest (or (plist-get params :latest) splunk-time-latest)
+          splunk-result-format (or (plist-get params :format) splunk-result-format)
+          splunk-result-limit (or (plist-get params :limit) splunk-result-limit))
+    (setq splunk--last-search-parameters (splunk--copy-search-parameters params))))
+
+(defun splunk-edit-current-search ()
+  "Prompt for the current search query and rerun it with existing settings."
+  (interactive)
+  (let* ((params (splunk--current-search-parameters))
+         (query (and params (plist-get params :query))))
+    (unless params
+      (user-error "No current search is available to edit"))
+    (let* ((query (read-string "Search query: " (or query "")))
+           (updated (plist-put (splunk--copy-search-parameters params) :query query)))
+      (splunk--apply-search-parameters updated)
+      (splunk-create-search-job query))))
+
 (defun splunk-login ()
   "Authenticate against Splunk and cache a session token.
 Prompts for credentials if not available in auth-source."
@@ -680,10 +769,11 @@ Prompts for credentials if not available in auth-source."
     (when (and user password)
       (concat "Basic " (base64-encode-string (concat user ":" password))))))
 
-(defun splunk-create-search-job-callback (cb-status &rest _cbargs)
+(defun splunk-create-search-job-callback (cb-status &rest cbargs)
   (let ((http-buf (current-buffer)))
     (unwind-protect
-        (let* ((json (splunk--read-json-body))
+        (let* ((search-params (splunk--copy-search-parameters (car cbargs)))
+               (json (splunk--read-json-body))
                (sid (or (and json (alist-get 'sid json))
                         (let* ((xml (splunk--read-xml-body))
                                (root (car-safe xml))
@@ -694,8 +784,15 @@ Prompts for credentials if not available in auth-source."
             (message "[splunk] job create body: %s" (or splunk--last-http-body "<none>")))
           (cond
            ((and sid (not (string-empty-p sid)))
-           (message "Search submitted. SID=%s" sid)
-            (splunk--poll-results sid 0))
+            (let* ((request-id (plist-get search-params :request-id))
+                   (updated (plist-put search-params :sid sid)))
+              (splunk--update-search-history-entry
+               request-id
+               (lambda (entry)
+                 (plist-put entry :sid sid)))
+              (splunk--maybe-update-last-search-parameters updated)
+              (message "Search submitted. SID=%s" sid)
+              (splunk--poll-results sid 0 updated)))
            (t
             (let* ((http-status (splunk--http-status))
                    (code (car http-status))
@@ -747,6 +844,7 @@ Prompts for credentials if not available in auth-source."
          (url-request-extra-headers (list (cons "Content-Type" "application/x-www-form-urlencoded")
                                           (cons "Accept" "application/json")
                                           auth-header))
+         (search-params (splunk--build-search-parameters search-query))
          (url-request-data (mapconcat #'identity
                                       (delq nil
                                             (list
@@ -759,10 +857,12 @@ Prompts for credentials if not available in auth-source."
                                                (format "max_count=%s" (number-to-string splunk-result-limit)))
                                              "output_mode=json"))
                                       "&")))
-    (push (list :query search-query :time (current-time)) splunk--search-history)
+    (setq splunk--last-search-parameters
+          (splunk--copy-search-parameters search-params))
+    (push (splunk--copy-search-parameters search-params) splunk--search-history)
     (splunk--url-retrieve-with-timeout url
                                        #'splunk-create-search-job-callback
-                                       nil
+                                       (list search-params)
                                        t
                                        (format "Search submission to %s:%s"
                                                splunk-host
@@ -804,6 +904,48 @@ Prompts for credentials if not available in auth-source."
       (splunk--parse-xml-tag 'sid)))
 
 ;; Results rendering
+(defconst splunk-results-font-lock-keywords
+  '(("\\_<\\(?:ERROR\\|WARN\\(?:ING\\)?\\|FATAL\\|CRITICAL\\|ALERT\\|EMERG\\|ERR\\|INFO\\|DEBUG\\|TRACE\\|NOTICE\\|Error\\|Warn\\(?:ing\\)?\\|Fatal\\|Critical\\|Info\\|Debug\\|Trace\\|Notice\\|error\\|warn\\(?:ing\\)?\\|fatal\\|critical\\|info\\|debug\\|trace\\|notice\\)\\_>"
+     0 'font-lock-keyword-face)
+    ("\\_<\\(?:Bad\\|BAD\\|bad\\|Failed\\|FAILED\\|failed\\|Failure\\|FAILURE\\|failure\\|Exception\\|EXCEPTION\\|exception\\|Denied\\|DENIED\\|denied\\|Timeout\\|TIMEOUT\\|timeout\\|Refused\\|REFUSED\\|refused\\)\\_>"
+     0 'error)
+    ("\\_<\\(?:OK\\|Ok\\|ok\\|Success\\|SUCCESS\\|success\\|Passed\\|PASSED\\|passed\\)\\_>"
+     0 'success)
+    ("\\_<\\(?:25[0-5]\\|2[0-4][0-9]\\|[01]?[0-9]?[0-9]\\)\\(?:\\.\\(?:25[0-5]\\|2[0-4][0-9]\\|[01]?[0-9]?[0-9]\\)\\)\\{3\\}\\_>"
+     0 'splunk-results-address-face)
+    ("\\_<[[:xdigit:]]\\{2\\}\\(?:[:-][[:xdigit:]]\\{2\\}\\)\\{5\\}\\_>"
+     0 'splunk-results-mac-face)
+    ("\\_<[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}[T ][0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}\\(?:[.,][0-9]+\\)?\\(?:Z\\|[+-][0-9]\\{2\\}:?[0-9]\\{2\\}\\)?\\_>"
+     0 'font-lock-constant-face))
+  "Font-lock patterns used in Splunk results and detail buffers.")
+
+(defvar-local splunk--results-row-map nil
+  "Hash table mapping tabulated result ids to full Splunk rows.")
+
+(defvar-local splunk--results-field-order nil
+  "Displayed field order for the current Splunk results buffer.")
+
+(defvar-local splunk--results-sid nil
+  "Search SID for the current Splunk results buffer.")
+
+(defvar-local splunk--search-parameters nil
+  "Search parameters associated with the current Splunk buffer.")
+
+(defvar-local splunk--results-follow-last-row-id nil
+  "Last row id shown by `splunk-results-follow-mode'.")
+
+(defcustom splunk-result-detail-window-width 0.45
+  "Preferred width for the result detail side window.
+If a float, it is interpreted as a fraction of the frame width."
+  :type '(choice float integer)
+  :group 'splunk)
+
+(defcustom splunk-overview-window-width 36
+  "Preferred width for the overview window when shown beside results.
+If a float, it is interpreted as a fraction of the frame width."
+  :type '(choice float integer)
+  :group 'splunk)
+
 (defun splunk--ensure-string (value)
   (cond
    ((stringp value) value)
@@ -813,6 +955,17 @@ Prompts for credentials if not available in auth-source."
    ((null value) "")
    ((listp value) (mapconcat #'splunk--ensure-string value ","))
    (t (format "%S" value))))
+
+(defun splunk--normalize-line-endings (value)
+  "Return VALUE as text with normalized line endings."
+  (replace-regexp-in-string "\r\n?" "\n" (splunk--ensure-string value) t t))
+
+(defun splunk--normalize-inline-text (value)
+  "Return VALUE as a single line suitable for compact display."
+  (string-trim
+   (replace-regexp-in-string "[[:space:]\n\r]+" " "
+                             (splunk--normalize-line-endings value)
+                             t t)))
 
 (defun splunk--extract-fields (results-json)
   (let ((fields (alist-get 'fields results-json)))
@@ -844,16 +997,341 @@ Prompts for credentials if not available in auth-source."
 (defun splunk--row-for-fields (row fields)
   (vconcat (mapcar (lambda (fname)
                      (let ((kv (assq (intern fname) row)))
-                       (splunk--ensure-string (if kv (cdr kv) ""))))
+                       (splunk--normalize-inline-text (if kv (cdr kv) ""))))
                    fields)))
+
+(defun splunk--result-row-id (row)
+  "Return a stable identifier for ROW."
+  (let ((cd (cdr (assq '_cd row))))
+    (if cd
+        (splunk--ensure-string cd)
+      (secure-hash 'sha1 (prin1-to-string row)))))
+
+(defun splunk--result-field-order (row)
+  "Return the display order for ROW fields in the current results buffer."
+  (let* ((row-fields (mapcar (lambda (kv) (symbol-name (car kv))) row))
+         (preferred (seq-filter (lambda (f) (member f row-fields))
+                                splunk--results-field-order))
+         (rest (seq-remove (lambda (f) (member f preferred)) row-fields)))
+    (append preferred rest)))
+
+(defun splunk--result-field-value (row field-name)
+  "Return FIELD-NAME from ROW as a display string."
+  (let ((kv (assq (intern field-name) row)))
+    (splunk--normalize-line-endings (if kv (cdr kv) ""))))
+
+(defvar splunk-search-view-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "1") #'splunk-edit-current-search)
+    (define-key map (kbd "?") #'splunk-dispatch)
+    (define-key map (kbd "d") #'splunk-dispatch)
+    map)
+  "Shared keymap for Splunk search result buffers.")
+
+(define-minor-mode splunk-search-view-mode
+  "Minor mode for navigating and rerunning Splunk search views."
+  :lighter nil
+  :keymap splunk-search-view-mode-map)
+
+(defun splunk--set-search-view-context (params)
+  "Attach search PARAMS to the current buffer and enable shared keys."
+  (setq-local splunk--search-parameters (splunk--copy-search-parameters params))
+  (splunk-search-view-mode 1))
+
+(define-derived-mode splunk-result-detail-mode special-mode "Splunk-Result-Detail"
+  "Mode for viewing a single Splunk result in detail."
+  (setq-local truncate-lines nil)
+  (setq-local font-lock-defaults '(splunk-results-font-lock-keywords t))
+  (splunk-search-view-mode 1))
+
+(defun splunk--result-detail-buffer-name (sid)
+  "Return the detail buffer name for SID."
+  (format "*Splunk Result Detail: %s*" sid))
+
+(defun splunk--insert-result-detail-field (row field-name)
+  "Insert FIELD-NAME and its value from ROW into the current buffer."
+  (let ((start (point))
+        (value (splunk--result-field-value row field-name)))
+    (insert (propertize (format "%s:" field-name)
+                        'face 'splunk-result-detail-field-face))
+    (if (string-match-p "\n" value)
+        (progn
+          (insert "\n" value)
+          (unless (string-suffix-p "\n" value)
+            (insert "\n")))
+      (insert " " value "\n"))
+    (insert "\n")
+    (add-text-properties start (point)
+                         `(splunk-field-name ,field-name
+                                             splunk-field-value ,value))))
+
+(defun splunk--window-target-width (width total-width)
+  "Return WIDTH as a target width within TOTAL-WIDTH columns."
+  (cond
+   ((and (floatp width)
+         (> width 0.0)
+         (< width 1.0))
+    (max window-min-width
+         (floor (* total-width width))))
+   ((integerp width)
+    (max window-min-width width))
+   (t nil)))
+
+(defun splunk--display-result-detail-buffer (buf)
+  "Display BUF in a dedicated reusable window to the right."
+  (let* ((reference-window (or (get-buffer-window (current-buffer) 0)
+                               (selected-window)))
+         (frame-total-width (frame-width))
+         (existing-window
+          (cl-find-if (lambda (window)
+                        (window-parameter window 'splunk-result-detail))
+                      (window-list nil 'nomini)))
+         (window (or existing-window
+                     (split-window reference-window nil 'right))))
+    (set-window-parameter window 'splunk-result-detail t)
+    (set-window-dedicated-p window nil)
+    (set-window-buffer window buf)
+    (let ((target-width (splunk--window-target-width splunk-result-detail-window-width
+                                                     frame-total-width)))
+      (when target-width
+        (ignore-errors
+          (window-resize window
+                         (- target-width (window-total-width window))
+                         t t))))
+    window))
+
+(defun splunk--display-overview-buffer (buffer)
+  "Display BUFFER in the current window and mark it as the overview."
+  (switch-to-buffer buffer)
+  (let ((window (selected-window)))
+    (set-window-parameter window 'splunk-overview t)
+    (set-window-parameter window 'splunk-results nil)
+    (set-window-parameter window 'splunk-result-detail nil)
+    (set-window-dedicated-p window nil)
+    window))
+
+(defun splunk--find-overview-window ()
+  "Return a live window showing the Splunk overview, if any."
+  (let ((name (and (boundp 'splunk-overview-buffer-name)
+                   splunk-overview-buffer-name)))
+    (or (and name (get-buffer-window name 0))
+        (and name
+             (cl-find-if (lambda (window)
+                           (and (window-parameter window 'splunk-overview)
+                                (string=
+                                 (buffer-name (window-buffer window))
+                                 name)))
+                         (window-list nil 'nomini))))))
+
+(defun splunk--display-results-buffer (buf)
+  "Display BUF, prioritizing results space when overview is visible."
+  (let* ((overview-window (splunk--find-overview-window))
+         (frame-total-width (frame-width))
+         (existing-window
+          (or (get-buffer-window buf 0)
+              (cl-find-if (lambda (window)
+                            (window-parameter window 'splunk-results))
+                          (window-list nil 'nomini)))))
+    (if (window-live-p overview-window)
+        (let ((window (or existing-window
+                          (split-window overview-window nil 'right))))
+          (set-window-parameter overview-window 'splunk-overview t)
+          (set-window-parameter window 'splunk-results t)
+          (set-window-dedicated-p window nil)
+          (set-window-buffer window buf)
+          (let ((target-width (splunk--window-target-width splunk-overview-window-width
+                                                           frame-total-width)))
+            (when target-width
+              (ignore-errors
+                (window-resize overview-window
+                               (- target-width (window-total-width overview-window))
+                               t t))
+              (window-preserve-size overview-window t t)))
+          (select-window window)
+          window)
+      (let ((window (pop-to-buffer buf)))
+        (when (window-live-p window)
+          (set-window-parameter window 'splunk-results t))
+        window))))
+
+(defun splunk--quote-search-value (value)
+  "Return VALUE quoted for use in a Splunk search filter."
+  (format "\"%s\""
+          (replace-regexp-in-string
+           "[\"\\\\]" "\\\\\\&"
+           (splunk--normalize-inline-text value)
+           t t)))
+
+(defun splunk--drill-down-on-field (field-name value)
+  "Run a refined search for FIELD-NAME equal to VALUE."
+  (let* ((params (splunk--current-search-parameters))
+         (base-query (string-trim (or (plist-get params :query) "")))
+         (inline-value (splunk--normalize-inline-text value)))
+    (unless params
+      (user-error "No current search is available for drill-down"))
+    (unless (and inline-value (not (string-empty-p inline-value)))
+      (user-error "Field %s is empty on this row" field-name))
+    (let* ((filter (format "%s=%s" field-name (splunk--quote-search-value inline-value)))
+           (updated-query (if (string-empty-p base-query)
+                              filter
+                            (format "%s %s" base-query filter)))
+           (updated (plist-put (splunk--copy-search-parameters params)
+                               :query updated-query)))
+      (splunk--apply-search-parameters updated)
+      (splunk-create-search-job updated-query))))
+
+(defun splunk-result-detail-drill-down ()
+  "Drill down from the field under point in a detail buffer."
+  (interactive)
+  (let ((field-name (get-text-property (point) 'splunk-field-name))
+        (value (get-text-property (point) 'splunk-field-value)))
+    (unless field-name
+      (user-error "Move point onto a field entry to drill down"))
+    (splunk--drill-down-on-field field-name value)))
+
+(defun splunk--result-column-index-at-point ()
+  "Return the zero-based results column index at point."
+  (let ((column (current-column))
+        (padding (or tabulated-list-padding 0))
+        (start 0)
+        (index 0)
+        found)
+    (while (and (< index (length tabulated-list-format))
+                (not found))
+      (let* ((spec (aref tabulated-list-format index))
+             (width (max 1 (nth 1 spec)))
+             (end (+ start width)))
+        (when (< column (+ end padding))
+          (setq found index))
+        (setq start (+ end padding))
+        (setq index (1+ index))))
+    (or found
+        (and (> index 0) (1- index)))))
+
+(defun splunk--result-field-at-point ()
+  "Return the current results-table field name at point."
+  (let ((index (splunk--result-column-index-at-point)))
+    (when (and index (< index (length tabulated-list-format)))
+      (nth 0 (aref tabulated-list-format index)))))
+
+(defun splunk-results-drill-down ()
+  "Run a search narrowed by the current table cell."
+  (interactive)
+  (unless (hash-table-p splunk--results-row-map)
+    (user-error "Results metadata not initialized for this buffer"))
+  (let* ((row-id (tabulated-list-get-id))
+         (row (and row-id (gethash row-id splunk--results-row-map)))
+         (field-name (splunk--result-field-at-point)))
+    (unless row
+      (user-error "No result entry on this line"))
+    (unless field-name
+      (user-error "Move point onto a field to drill down"))
+    (splunk--drill-down-on-field field-name
+                                 (splunk--result-field-value row field-name))))
+
+(defun splunk-results-show-entry ()
+  "Show the current result row in a detail buffer."
+  (interactive)
+  (unless (hash-table-p splunk--results-row-map)
+    (user-error "Results metadata not initialized for this buffer"))
+  (let* ((row-id (tabulated-list-get-id))
+         (row (and row-id (gethash row-id splunk--results-row-map)))
+         (sid splunk--results-sid)
+         (search-params (splunk--copy-search-parameters splunk--search-parameters)))
+    (unless row
+      (user-error "No result entry on this line"))
+    (let* ((field-order (splunk--result-field-order row))
+           (buf (get-buffer-create (splunk--result-detail-buffer-name sid))))
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (splunk-result-detail-mode)
+          (splunk--set-search-view-context search-params)
+          (setq-local header-line-format "RET: drill down  1: edit search  q: close")
+          (insert (format "Search SID: %s\n" sid))
+          (insert (format "Row ID: %s\n\n" row-id))
+          (dolist (field-name field-order)
+            (splunk--insert-result-detail-field row field-name))
+          (goto-char (point-min))
+          (font-lock-ensure)))
+      (splunk--display-result-detail-buffer buf))))
+
+(defun splunk--results-follow-post-command ()
+  "Keep the detail pane synced with point in `splunk-results-follow-mode'."
+  (let ((row-id (tabulated-list-get-id)))
+    (unless (equal row-id splunk--results-follow-last-row-id)
+      (setq splunk--results-follow-last-row-id row-id)
+      (when (and row-id (hash-table-p splunk--results-row-map))
+        (splunk-results-show-entry)))))
+
+(define-minor-mode splunk-results-follow-mode
+  "When enabled, keep the detail window synced to the selected result row."
+  :lighter " Follow"
+  (if splunk-results-follow-mode
+      (progn
+        (add-hook 'post-command-hook #'splunk--results-follow-post-command nil t)
+        (setq-local splunk--results-follow-last-row-id nil)
+        (splunk--results-follow-post-command))
+    (remove-hook 'post-command-hook #'splunk--results-follow-post-command t)
+    (setq-local splunk--results-follow-last-row-id nil)))
+
+(defvar splunk-results-interaction-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'splunk-results-drill-down)
+    (define-key map (kbd "<return>") #'splunk-results-drill-down)
+    (define-key map (kbd "C-m") #'splunk-results-drill-down)
+    (define-key map (kbd "o") #'splunk-results-show-entry)
+    (define-key map (kbd "v") #'splunk-results-show-entry)
+    (define-key map (kbd "C-c C-f") #'splunk-results-follow-mode)
+    map)
+  "Keymap for interactive commands in `splunk-results-mode'.")
+
+(define-minor-mode splunk-results-interaction-mode
+  "Minor mode that provides stable interactive keys for Splunk results."
+  :lighter nil
+  :keymap splunk-results-interaction-mode-map)
 
 (define-derived-mode splunk-results-mode tabulated-list-mode "Splunk-Results"
   "Mode for viewing Splunk search results."
   (setq-local truncate-lines t)
   (setq-local tabulated-list-padding 2)
-  (setq-local tabulated-list-use-header-line t))
+  (setq-local tabulated-list-use-header-line t)
+  (setq-local font-lock-defaults '(splunk-results-font-lock-keywords t))
+  (splunk-search-view-mode 1)
+  (splunk-results-interaction-mode 1))
 
-(defun splunk--render-results-tabulated (sid results-json)
+(define-key splunk-results-mode-map (kbd "RET") #'splunk-results-drill-down)
+(define-key splunk-results-mode-map (kbd "<return>") #'splunk-results-drill-down)
+(define-key splunk-results-mode-map (kbd "C-m") #'splunk-results-drill-down)
+(define-key splunk-results-mode-map (kbd "o") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "v") #'splunk-results-show-entry)
+(define-key splunk-results-mode-map (kbd "C-c C-f") #'splunk-results-follow-mode)
+(define-key splunk-result-detail-mode-map (kbd "RET") #'splunk-result-detail-drill-down)
+(define-key splunk-result-detail-mode-map (kbd "<return>") #'splunk-result-detail-drill-down)
+(define-key splunk-result-detail-mode-map (kbd "C-m") #'splunk-result-detail-drill-down)
+
+(with-eval-after-load 'evil
+  (evil-make-intercept-map splunk-results-interaction-mode-map)
+  (evil-define-key* '(normal motion) splunk-results-mode-map
+    (kbd "RET") #'splunk-results-drill-down
+    (kbd "<return>") #'splunk-results-drill-down
+    (kbd "o") #'splunk-results-show-entry
+    (kbd "v") #'splunk-results-show-entry
+    (kbd "zf") #'splunk-results-follow-mode)
+  (evil-define-key* '(normal motion) splunk-result-detail-mode-map
+    (kbd "RET") #'splunk-result-detail-drill-down
+    (kbd "<return>") #'splunk-result-detail-drill-down))
+
+(defun splunk--column-width-for-field (name)
+  "Return a display width for column NAME."
+  (let ((base-width (cond
+                     ((string= name "_raw") splunk-column-max-width)
+                     ((string= name "_time") splunk-time-column-width)
+                     (t (round (* 1.8 (max 10 (length name))))))))
+    (max splunk-column-min-width
+         (min splunk-column-max-width base-width))))
+
+(defun splunk--render-results-tabulated (sid results-json &optional search-params)
   (let* ((results (alist-get 'results results-json))
          (raw-fields (or (splunk--extract-fields results-json)
                          '("_time" "host" "source" "sourcetype" "_raw")))
@@ -861,48 +1339,55 @@ Prompts for credentials if not available in auth-source."
          (buf (get-buffer-create (format "*Splunk Results: %s*" sid))))
     (with-current-buffer buf
       (let* ((columns-list (mapcar (lambda (name)
-                                     (let* ((base-width (if (string= name "_raw") splunk-column-max-width
-                                                          (round (* 1.8 (max 10 (length name))))))
-                                            (width (max splunk-column-min-width
-                                                        (min splunk-column-max-width base-width))))
-                                       (list name width t)))
+                                     (list name (splunk--column-width-for-field name) t))
                                    fields))
              (columns (apply 'vector columns-list))
+             (row-map (make-hash-table :test #'equal))
              (entries (mapcar (lambda (row)
-                                (list (or (cdr (assq '_cd row)) (format "%s" (random)))
-                                      (splunk--row-for-fields row fields)))
+                                (let ((row-id (splunk--result-row-id row)))
+                                  (puthash row-id row row-map)
+                                  (list row-id
+                                        (splunk--row-for-fields row fields))))
                               results)))
+        (splunk-results-mode)
+        (splunk--set-search-view-context search-params)
         (setq tabulated-list-format columns
               tabulated-list-entries entries)
-        (splunk-results-mode)
+        (setq-local splunk--results-row-map row-map)
+        (setq-local splunk--results-field-order fields)
+        (setq-local splunk--results-sid sid)
         (tabulated-list-init-header)
         (tabulated-list-print t)
+        (font-lock-ensure)
         (goto-char (point-min))))
-    (pop-to-buffer buf)))
+    (splunk--display-results-buffer buf)))
 
-(defun splunk--render-results-raw (sid results-json)
+(defun splunk--render-results-raw (sid results-json &optional search-params)
   (let* ((results (alist-get 'results results-json))
          (buf (get-buffer-create (format "*Splunk Raw: %s*" sid))))
     (with-current-buffer buf
       (erase-buffer)
+      (splunk--set-search-view-context search-params)
       (let ((inhibit-message t))
         (dolist (row results)
           (let ((raw (cdr (assq '_raw row))))
-            (insert (splunk--ensure-string raw) "\n"))))
+            (insert (splunk--normalize-line-endings raw) "\n"))))
       (goto-char (point-min))
       (view-mode 1))
-    (pop-to-buffer buf)))
+    (splunk--display-results-buffer buf)))
 
-(defun splunk--render-results-buffer (sid results-json)
-  (pcase splunk-result-format
+(defun splunk--render-results-buffer (sid results-json &optional search-params)
+  (let ((format (or (plist-get search-params :format) splunk-result-format)))
+    (pcase format
     ('json
      (let ((buf (get-buffer-create (format "*Splunk JSON: %s*" sid))))
        (with-current-buffer buf
          (erase-buffer)
+         (splunk--set-search-view-context search-params)
          (insert (pp-to-string results-json))
          (goto-char (point-min))
          (view-mode 1))
-       (pop-to-buffer buf)))
+       (splunk--display-results-buffer buf)))
     ('csv
      (let* ((fields (or (splunk--extract-fields results-json)
                         '("_time" "host" "source" "sourcetype" "_raw")))
@@ -910,11 +1395,13 @@ Prompts for credentials if not available in auth-source."
             (buf (get-buffer-create (format "*Splunk CSV: %s*" sid))))
        (with-current-buffer buf
          (erase-buffer)
+         (splunk--set-search-view-context search-params)
          (insert (mapconcat #'identity fields ",") "\n")
          (dolist (row results)
            (insert (mapconcat (lambda (f)
                                 (let* ((kv (assq (intern f) row))
-                                       (val (splunk--ensure-string (if kv (cdr kv) ""))))
+                                       (val (splunk--normalize-inline-text
+                                             (if kv (cdr kv) ""))))
                                   ;; basic CSV escaping
                                   (if (string-match-p ",[\"]" val)
                                       (concat "\"" (replace-regexp-in-string "\"" "\"\"" val) "\"")
@@ -923,11 +1410,11 @@ Prompts for credentials if not available in auth-source."
                    "\n"))
          (goto-char (point-min))
          (view-mode 1))
-       (pop-to-buffer buf)))
-    ('raw (splunk--render-results-raw sid results-json))
-    (_ (splunk--render-results-tabulated sid results-json))))
+       (splunk--display-results-buffer buf)))
+    ('raw (splunk--render-results-raw sid results-json search-params))
+    (_ (splunk--render-results-tabulated sid results-json search-params)))))
 
-(defun splunk--handle-results-response (sid _status)
+(defun splunk--handle-results-response (sid _status &optional search-params)
   (let ((http-buf (current-buffer)))
     (unwind-protect
         (let* ((json (splunk--read-json-body))
@@ -940,45 +1427,52 @@ Prompts for credentials if not available in auth-source."
           (cond
            ;; Final response (preview=false) with results key present (may be empty)
            ((and has-results-key (eq preview :json-false))
-            (splunk--render-results-buffer sid json)
-            (let* ((current (or (car splunk--search-history)
-                                (list :query "" :time (current-time))))
-                   (current (plist-put current :sid sid))
-                   (current (plist-put current :results json)))
-              (if (null splunk--search-history)
-                  (setq splunk--search-history (list current))
-                (setcar splunk--search-history current)))
+            (let ((updated (when search-params
+                             (let ((entry (splunk--copy-search-parameters search-params)))
+                               (setq entry (plist-put entry :sid sid))
+                               (setq entry (plist-put entry :results json))
+                               entry))))
+              (splunk--render-results-buffer sid json updated)
+              (when updated
+                (splunk--update-search-history-entry
+                 (plist-get updated :request-id)
+                 (lambda (entry)
+                   (setq entry (plist-put entry :sid sid))
+                   (plist-put entry :results json)))
+                (splunk--maybe-update-last-search-parameters updated)))
             (when splunk-debug
               (message (if results
                            (format "Search complete: %s (%d result%s)" sid (length results) (if (= (length results) 1) "" "s"))
                          (format "Search complete: %s (0 results)" sid)))))
            ;; Not final yet → keep polling, unless we got an HTTP error (e.g., 502/503 with empty body)
            (t
-            (let ((status (splunk--http-status)))
+           (let ((status (splunk--http-status)))
               (if (and status (>= (car status) 400))
                   (message "Results polling failed: %s %s" (car status) (cdr status))
-                (run-at-time 1.0 nil #'splunk--poll-results sid 1))))))
+                (run-at-time 1.0 nil #'splunk--poll-results sid 1 search-params))))))
       (when (buffer-live-p http-buf)
         (kill-buffer http-buf)))))
 
 (defun splunk--handle-results-response-cb (status &rest cbargs)
-  (let ((sid (car cbargs)))
-    (splunk--handle-results-response sid status)))
+  (let ((sid (nth 0 cbargs))
+        (search-params (nth 1 cbargs)))
+    (splunk--handle-results-response sid status search-params)))
 
-(defun splunk--poll-results (sid attempt)
+(defun splunk--poll-results (sid attempt &optional search-params)
   ;; Apply SSL settings
   (splunk--apply-ssl-settings)
   (let* ((url-request-method "GET")
          (url-request-extra-headers (list (splunk--current-auth-header)
                                           (cons "Accept" "application/json")))
+         (result-limit (or (plist-get search-params :limit) splunk-result-limit))
          ;; `results_preview` is the endpoint that returns intermediate results
          ;; while a job is still running; when preview becomes false the payload
          ;; is equivalent to final results.
          (url (format "https://%s:%s/services/search/jobs/%s/results_preview/?output_mode=json&count=%s"
-                      splunk-host splunk-port sid splunk-result-limit)))
+                      splunk-host splunk-port sid result-limit)))
     (splunk--url-retrieve-with-timeout url
                                        #'splunk--handle-results-response-cb
-                                       (list sid)
+                                       (list sid search-params)
                                        t
                                        (format "Results preview request for SID %s" sid))))
 
@@ -1071,7 +1565,7 @@ Prompts for credentials if not available in auth-source."
         (insert "Welcome to Splunk Overview.\n"))
       (when successor
         (magit-section-goto-successor successor)))
-    (switch-to-buffer buffer)))
+    (splunk--display-overview-buffer buffer)))
 
 (defun splunk-overview-refresh ()
   "Refresh the Splunk overview buffer if visible."
@@ -1197,7 +1691,8 @@ Prompts for credentials if not available in auth-source."
     (let ((buf (get-buffer-create "*Splunk Recent Searches*")))
       (with-current-buffer buf
         (erase-buffer)
-        (insert "Recent Searches:\n\n")
+        (splunk--set-search-view-context (car splunk--search-history))
+        (insert "Recent Searches (press 1 to edit the latest search):\n\n")
         (dolist (h splunk--search-history)
           (insert (format "- %s  (sid: %s)\n" (plist-get h :query) (or (plist-get h :sid) "pending"))))
         (goto-char (point-min))
